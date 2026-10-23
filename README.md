@@ -1,10 +1,12 @@
 # UAV OMMPC ROS 2 / PX4 bridge
 
-Minimal ROS 2 Jazzy communication packages for PX4 v1.17. This repository does **not** implement the user's OMMPC algorithm. An external controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs.
+Minimal ROS 2 Jazzy **C++17 / rclcpp** communication packages for PX4 v1.17. This repository does **not** implement the user's OMMPC algorithm. An external controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs. The Python bridge has been removed; `ros2 run uav_ommpc_ros px4_bridge` and all public topics, messages, QoS and startup parameters remain unchanged. Only the SITL test utilities use Python.
 
 ## Build and environment
 
 Dependencies on this Jetson: ROS 2 Jazzy (`/opt/ros/jazzy`), `px4_msgs` release/1.17 in `~/ros2_px4_ws`, PX4 v1.17.0 in `~/PX4-Autopilot`, Gazebo Harmonic and Micro XRCE-DDS Agent v2.4.3. Build the PX4 message workspace before this overlay. Message definitions must match PX4.
+
+`uav_ommpc_ros` uses `ament_cmake` and links against `rclcpp`, `px4_msgs` and `uav_ommpc_interfaces`. When migrating an already-built Python workspace, remove its obsolete generated `build/uav_ommpc_ros` and `install/uav_ommpc_ros` directories before rebuilding; source the ROS/px4_msgs underlays, not the old project overlay.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -12,7 +14,8 @@ cd ~/ros2_px4_ws
 colcon build --symlink-install --packages-select px4_msgs
 source ~/ros2_px4_ws/install/setup.bash
 cd ~/uav_control_ws
-colcon build --symlink-install --packages-select uav_ommpc_interfaces uav_ommpc_ros
+colcon build --symlink-install --packages-select uav_ommpc_interfaces uav_ommpc_ros \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
 source ~/uav_control_ws/install/setup.bash
 ```
 
@@ -119,20 +122,20 @@ The default result directory is `~/uav_control_ws/flight-test-results`. Consult 
 
 ### Observed SITL verification
 
-On the installed Jetson stack, both packages built successfully. A separate live, disarmed DDS smoke verified odometry forwarding, signed FRD rate mapping, gravity/hover conversion, zero and saturated thrust, body-rate-only Offboard flags, and publication stopping after the input timeout.
+On the installed Jetson stack, both packages built successfully in Release mode; the installed bridge is a native ARM64 ELF executable. A separate live, disarmed DDS smoke verified odometry forwarding, signed FRD rate mapping, gravity/hover conversion, zero and saturated thrust, body-rate-only Offboard flags, publication stopping after the input timeout, and rejected negative/nonfinite inputs not refreshing that timeout.
 
-The flight acceptance passed with `hover_thrust=0.728744`. Evidence is retained outside the repository at `~/uav_control_ws/flight-test-results/run-04/result.json` and `trace.csv`.
+The **C++ bridge** passed the unchanged flight acceptance with `hover_thrust=0.728744`. Evidence is retained outside the repository at `~/uav_control_ws/flight-test-results/cpp-run-01/`: `communication.json`, `result.json` and `trace.csv`. The previous Python flight evidence remains in `run-04`.
 
 | Observed measurement | Value |
 | --- | --- |
-| Maximum height above initial ground | 2.065 m |
-| Initial hover stable window | 5.009 s |
-| Initial hover position RMS error | 0.082 m |
-| Second hover stable window | 5.014 s |
-| Second hover position RMS error | 0.124 m |
+| Maximum height above initial ground | 2.080 m |
+| Initial hover stable window | 5.045 s |
+| Initial hover position RMS error | 0.074 m |
+| Second hover stable window | 5.008 s |
+| Second hover position RMS error | 0.121 m |
 | Second target displacement | North 1.0 m, East 0.5 m, yaw +0.25 rad |
 | Final landing | PX4 native NAV_LAND, land detection and ground disarm observed |
 
 All three nonzero body-rate axes and positive thrust were observed at the PX4 ROS input, and actual measured motion satisfied the hold criteria. Offboard, arm and land commands received accepted PX4 acknowledgements. No preflight/failsafe parameters were disabled or force-arming used.
 
-The test keeps odometry freshness at 0.5 s and allows 1.5 s for VehicleStatus: PX4 Commander normally publishes unchanged status at 2 Hz (`Commander.cpp`), so a 0.5 s status timeout would reject normal operation. Earlier aborted attempts and their available evidence remain in `run-01` through `run-03`; the initial run's JSON was truncated by a serialization bug subsequently fixed. The 0.60 initial hover estimate did not lift this motor model; the model-derived calibration above was required.
+The test keeps odometry freshness at 0.5 s and allows 1.5 s for VehicleStatus: PX4 Commander normally publishes unchanged status at 2 Hz (`Commander.cpp`), so a 0.5 s status timeout would reject normal operation. The 0.60 initial hover estimate did not lift this motor model; the model-derived calibration above is required. The C++ migration did not change the flight script, acceptance criteria or PX4 safety parameters.
