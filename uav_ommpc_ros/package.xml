@@ -9,5 +9,6 @@
   <depend>rclcpp</depend>
   <depend>px4_msgs</depend>
   <depend>uav_ommpc_interfaces</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

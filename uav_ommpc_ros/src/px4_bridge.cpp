@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <px4_msgs/msg/offboard_control_mode.hpp>
@@ -15,6 +17,8 @@
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <uav_ommpc_interfaces/msg/thrust_rates.hpp>
 
+#include "command_state.hpp"
+
 namespace
 {
 using px4_msgs::msg::OffboardControlMode;
@@ -24,20 +28,33 @@ using px4_msgs::msg::VehicleOdometry;
 using px4_msgs::msg::VehicleRatesSetpoint;
 using px4_msgs::msg::VehicleStatus;
 using uav_ommpc_interfaces::msg::ThrustRates;
-using SteadyClock = std::chrono::steady_clock;
+using uav_ommpc_ros::CommandState;
+using uav_ommpc_ros::Limits;
 
 class Px4Bridge final : public rclcpp::Node
 {
 public:
   Px4Bridge() : Node("px4_bridge")
   {
-    hover_thrust_ = declare_parameter<double>("hover_thrust", 0.60);
+    const auto hover_thrust = declare_parameter<double>("hover_thrust", 0.60);
+    const auto max_body_rates =
+      declare_parameter<std::vector<double>>("max_body_rates", std::vector<double>{3.0, 3.0, 1.5});
+    const auto max_throttle = declare_parameter<double>("max_throttle", 0.9);
     const auto rate = declare_parameter<double>("rate", 50.0);
     const auto timeout = declare_parameter<double>("command_timeout", 0.5);
     const auto target_system = declare_parameter<std::int64_t>("target_system", 1);
     const auto target_component = declare_parameter<std::int64_t>("target_component", 1);
-    if (!std::isfinite(hover_thrust_) || hover_thrust_ <= 0.0 || hover_thrust_ > 1.0) {
+    if (!std::isfinite(hover_thrust) || hover_thrust <= 0.0 || hover_thrust > 1.0) {
       throw std::invalid_argument("hover_thrust must be finite and in (0, 1]");
+    }
+    if (max_body_rates.size() != 3 ||
+      !std::all_of(max_body_rates.begin(), max_body_rates.end(),
+        [](double limit) {return std::isfinite(limit) && limit > 0.0;}))
+    {
+      throw std::invalid_argument("max_body_rates must contain three finite positive values");
+    }
+    if (!std::isfinite(max_throttle) || max_throttle <= 0.0 || max_throttle > 1.0) {
+      throw std::invalid_argument("max_throttle must be finite and in (0, 1]");
     }
     if (!std::isfinite(rate) || rate <= 0.0) {
       throw std::invalid_argument("rate must be finite and positive");
@@ -52,7 +69,10 @@ public:
     }
     target_system_ = static_cast<std::uint8_t>(target_system);
     target_component_ = static_cast<std::uint8_t>(target_component);
-    command_timeout_ = std::chrono::duration<double>(timeout);
+    state_.emplace(
+      Limits{hover_thrust, {max_body_rates[0], max_body_rates[1], max_body_rates[2]}, max_throttle},
+      std::chrono::duration_cast<CommandState::Clock::duration>(
+        std::chrono::duration<double>(timeout)));
 
     const auto reliable = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
     const auto telemetry = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
@@ -67,7 +87,10 @@ public:
       [this](const VehicleOdometry & message) {state_pub_->publish(message);});
     status_sub_ = create_subscription<VehicleStatus>(
       "/fmu/out/vehicle_status_v1", telemetry,
-      [this](const VehicleStatus & message) {status_pub_->publish(message);});
+      [this](const VehicleStatus & message) {
+        offboard_ = message.nav_state == VehicleStatus::NAVIGATION_STATE_OFFBOARD;
+        status_pub_->publish(message);
+      });
     ack_sub_ = create_subscription<VehicleCommandAck>(
       "/fmu/out/vehicle_command_ack", telemetry,
       [this](const VehicleCommandAck & message) {ack_pub_->publish(message);});
@@ -98,40 +121,42 @@ private:
 
   void on_control(const ThrustRates & message)
   {
-    if (!std::isfinite(message.thrust_acceleration) || message.thrust_acceleration < 0.0 ||
-      !std::all_of(message.body_rates.begin(), message.body_rates.end(),
-        [](double rate) {return std::isfinite(rate);}))
-    {
+    if (!state_->accept(message, CommandState::Clock::now())) {
       RCLCPP_WARN(get_logger(), "Rejected nonfinite rates/thrust or negative thrust");
       return;
     }
-    rates_.roll = static_cast<float>(message.body_rates[0]);
-    rates_.pitch = static_cast<float>(message.body_rates[1]);
-    rates_.yaw = static_cast<float>(message.body_rates[2]);
-    rates_.thrust_body[2] = -static_cast<float>(
-      std::clamp(hover_thrust_ * message.thrust_acceleration / 9.80665, 0.0, 1.0));
-    last_control_time_ = SteadyClock::now();
-    has_control_ = true;
+    if (state_->command().limited) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000, "Control input limited by max_body_rates/max_throttle");
+    }
   }
 
   void publish_control()
   {
-    if (!has_control_ || SteadyClock::now() - last_control_time_ > command_timeout_) {
+    if (!state_->fresh(CommandState::Clock::now())) {
       return;
     }
     const auto timestamp = timestamp_us();
     mode_.timestamp = timestamp;
-    rates_.timestamp = timestamp;
     mode_pub_->publish(mode_);
+    // PX4 rate control uses the newest rate setpoint from any source, so never
+    // compete with PX4's own attitude controller outside Offboard.
+    if (!offboard_) {
+      return;
+    }
+    const auto & command = state_->command();
+    rates_.timestamp = timestamp;
+    rates_.roll = command.body_rates[0];
+    rates_.pitch = command.body_rates[1];
+    rates_.yaw = command.body_rates[2];
+    rates_.thrust_body[2] = -command.throttle;
     rates_pub_->publish(rates_);
   }
 
-  double hover_thrust_{};
   std::uint8_t target_system_{};
   std::uint8_t target_component_{};
-  std::chrono::duration<double> command_timeout_{};
-  SteadyClock::time_point last_control_time_{};
-  bool has_control_{false};
+  std::optional<CommandState> state_;
+  bool offboard_{false};
   OffboardControlMode mode_{};
   VehicleRatesSetpoint rates_{};
   rclcpp::Publisher<VehicleOdometry>::SharedPtr state_pub_;

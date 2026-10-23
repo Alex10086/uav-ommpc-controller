@@ -14,4 +14,12 @@ endif()
 ament_target_dependencies(px4_bridge rclcpp px4_msgs uav_ommpc_interfaces)
 install(TARGETS px4_bridge DESTINATION lib/${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_command_state test/test_command_state.cpp)
+  target_include_directories(test_command_state PRIVATE src)
+  target_compile_features(test_command_state PRIVATE cxx_std_17)
+  ament_target_dependencies(test_command_state uav_ommpc_interfaces)
+endif()
+
 ament_package()

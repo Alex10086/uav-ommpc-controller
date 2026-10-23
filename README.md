@@ -30,11 +30,11 @@ source ~/uav_control_ws/install/setup.bash
 
 ```bash
 ros2 run uav_ommpc_ros px4_bridge --ros-args \
-  -p hover_thrust:=0.728744 -p rate:=50.0 -p command_timeout:=0.5 \
-  -p target_system:=1 -p target_component:=1
+  -p hover_thrust:=0.728744 -p max_body_rates:="[3.0, 3.0, 1.5]" -p max_throttle:=0.9 \
+  -p rate:=50.0 -p command_timeout:=0.5 -p target_system:=1 -p target_component:=1
 ```
 
-Parameters are read at startup; restart to change them. `rate` is outgoing setpoint/heartbeat frequency in Hz. `command_timeout` is maximum accepted-input age in seconds, measured with a monotonic clock. `hover_thrust` must be in (0, 1], rate and timeout positive, and target IDs in [1, 255].
+Parameters are read at startup; restart to change them. `rate` is outgoing setpoint/heartbeat frequency in Hz. `command_timeout` is maximum accepted-input age in seconds, measured with a monotonic clock. `hover_thrust` and `max_throttle` must be in (0, 1], `max_body_rates` must contain three positive roll/pitch/yaw limits in rad/s, rate and timeout must be positive, and target IDs in [1, 255].
 
 ## Public interface
 
@@ -58,10 +58,12 @@ Telemetry remains in raw PX4 frames, without an ENU/FLU transform: position/velo
 The bridge subscribes with best-effort QoS to `/fmu/out/vehicle_odometry` (message version 0), `/fmu/out/vehicle_status_v1`, and `/fmu/out/vehicle_command_ack`. It publishes reliable volatile `/fmu/in/offboard_control_mode`, `/fmu/in/vehicle_rates_setpoint`, and `/fmu/in/vehicle_command`. Only `body_rate` is enabled in `OffboardControlMode`; all other flags remain false.
 
 ```text
-roll, pitch, yaw = body_rates
-throttle = clip(hover_thrust * thrust_acceleration / 9.80665, 0, 1)
+roll, pitch, yaw = clip(body_rates, -max_body_rates, +max_body_rates)   # per axis
+throttle = min(hover_thrust * thrust_acceleration / 9.80665, max_throttle)
 thrust_body = [0, 0, -throttle]
 ```
+
+Defaults are `max_body_rates=[3.0, 3.0, 1.5]` rad/s and `max_throttle=0.9` (keeping attitude-control headroom). Limiting is silent to PX4 but logs a throttled warning once per second; the controller is not otherwise notified.
 
 For example, in a sourced ROS terminal (this publishes input only; it does not arm):
 
@@ -70,7 +72,7 @@ ros2 topic pub -r 50 /uav/control_input uav_ommpc_interfaces/msg/ThrustRates \
   '{thrust_acceleration: 9.80665, body_rates: [0.0, 0.0, 0.0]}'
 ```
 
-This is an **approximate normalized-throttle mapping**, not a physical motor/thrust model or guaranteed acceleration tracking. The node's generic default is `hover_thrust=0.60`; explicitly use **0.728744 for this installed Gazebo x500**. Its model has mass 2.06430769 kg, four motor constants 8.54858e-6, and linear ESC speed range 150–1000 rad/s (`THR_MDL_FAC=0`): `omega_hover=sqrt(mass*g/(4*k))=769.4326`, so normalized hover is `(omega_hover-150)/850=0.728744`. PX4's `MPC_THR_HOVER=0.60` is an initial controller estimate, not a sufficient calibration for this external feedforward path. Other vehicles, battery conditions and payloads require calibration. Saturation limits normalized thrust only; there is no rate limiting or flight-envelope enforcement.
+This is an **approximate normalized-throttle mapping**, not a physical motor/thrust model or guaranteed acceleration tracking. The node's generic default is `hover_thrust=0.60`; explicitly use **0.728744 for this installed Gazebo x500**. Its model has mass 2.06430769 kg, four motor constants 8.54858e-6, and linear ESC speed range 150–1000 rad/s (`THR_MDL_FAC=0`): `omega_hover=sqrt(mass*g/(4*k))=769.4326`, so normalized hover is `(omega_hover-150)/850=0.728744`. PX4's `MPC_THR_HOVER=0.60` is an initial controller estimate, not a sufficient calibration for this external feedforward path. Other vehicles, battery conditions and payloads require calibration. The mapping is exact only at hover; with this motor model thrust grows with the square of rotor speed, so non-hover accelerations deviate. There is no slew-rate or tilt limiting.
 
 Forwarded vehicle commands preserve their command and parameters but replace timestamp, `source_system=250`, `source_component=190`, configured target IDs, and `from_external=True`. Generated command/setpoint timestamps use ROS clock microseconds (wall clock by default; do not enable simulated ROS time without arranging its clock source).
 
@@ -78,7 +80,27 @@ Forwarded vehicle commands preserve their command and parameters but replace tim
 
 The bridge **never automatically arms or changes flight mode**. External software must explicitly request and confirm these actions, satisfy PX4 offboard entry requirements, and monitor status/acknowledgements. Stream setpoints before requesting offboard mode. PX4 must be connected through a running Micro XRCE-DDS Agent and expose the expected DDS topics.
 
-Nonfinite input values and negative thrust are rejected without refreshing the timeout. Otherwise the last accepted input is repeated at the configured rate. Before the first input or after `command_timeout`, both offboard heartbeat and rate-setpoint publication stop. The bridge does not send zero thrust, land, disarm, retry, or choose recovery modes. PX4's configured offboard-loss failsafe determines the result. Telemetry and explicit vehicle commands continue. This basic timeout is not a complete safety system. Ctrl-C does not itself land or disarm a vehicle.
+Nonfinite input values and negative thrust are rejected without refreshing the timeout or replacing the previous command. Otherwise the last accepted, limited input is repeated at the configured rate.
+
+| Condition | `offboard_control_mode` heartbeat | `vehicle_rates_setpoint` |
+| --- | --- | --- |
+| No accepted input yet, or input older than `command_timeout` | stopped | stopped |
+| Fresh input, PX4 `nav_state` is not Offboard | published | **not published** |
+| Fresh input, PX4 `nav_state` is Offboard | published | published |
+
+The heartbeat must flow before PX4 can enter Offboard, so it is not gated by mode. Rate setpoints are gated because PX4's `mc_rate_control` uses the newest `vehicle_rates_setpoint` from any publisher; outside Offboard they would compete with PX4's own attitude controller. The gate follows the latest received `VehicleStatus` (PX4 publishes it immediately on a mode change).
+
+The bridge does not send zero thrust, land, disarm, retry, or choose recovery modes. After the input times out, PX4 holds the last setpoint until its offboard-loss timeout (`COM_OF_LOSS_T`, default 1.0 s) and then applies its configured offboard-loss failsafe. Telemetry and explicit vehicle commands continue. This is not a complete safety system. Ctrl-C does not itself land or disarm a vehicle.
+
+## Unit tests
+
+Input validation, limits and timeout logic live in `uav_ommpc_ros/src/command_state.hpp` and are tested with injected time (no ROS or PX4 needed):
+
+```bash
+cd ~/uav_control_ws
+colcon test --packages-select uav_ommpc_ros
+colcon test-result --verbose --test-result-base build/uav_ommpc_ros
+```
 
 ## SITL flight test
 
@@ -122,20 +144,31 @@ The default result directory is `~/uav_control_ws/flight-test-results`. Consult 
 
 ### Observed SITL verification
 
-On the installed Jetson stack, both packages built successfully in Release mode; the installed bridge is a native ARM64 ELF executable. A separate live, disarmed DDS smoke verified odometry forwarding, signed FRD rate mapping, gravity/hover conversion, zero and saturated thrust, body-rate-only Offboard flags, publication stopping after the input timeout, and rejected negative/nonfinite inputs not refreshing that timeout.
+On the installed Jetson stack, both packages built successfully in Release mode; the installed bridge is a native ARM64 ELF executable, and the 6 `CommandState` unit tests pass.
 
-The **C++ bridge** passed the unchanged flight acceptance with `hover_thrust=0.728744`. Evidence is retained outside the repository at `~/uav_control_ws/flight-test-results/cpp-run-01/`: `communication.json`, `result.json` and `trace.csv`. The previous Python flight evidence remains in `run-04`.
+A live, **disarmed** check against PX4 SITL (`cpp-run-02/communication.json`) observed:
+
+| PX4 state / input | Heartbeat messages | Rate setpoints |
+| --- | ---: | ---: |
+| Fresh input, not Offboard (1.5 s) | 76 | 0 |
+| Fresh input, Offboard (1.0 s) | 50 | 50 |
+| Fresh input, after switching to Hold (1.0 s) | 50 | 0 |
+| Input stopped, after timeout (0.5 s) | 0 | 0 |
+
+In Offboard, input `[0.1, -0.2, 0.3]` rad/s at 1 g produced `[0.1, -0.2, 0.3]` and thrust `-0.728744`; input `[4, -5, 2]` rad/s at 30 m/s² was limited to `[3, -3, 1.5]` and thrust `-0.9`.
+
+The gated C++ bridge then passed the unchanged flight acceptance with `hover_thrust=0.728744` and default limits (`cpp-run-02/result.json`, `trace.csv`; earlier evidence remains in `cpp-run-01` and `run-04`). PX4 received 1020 heartbeats but only 893 rate setpoints, consistent with rate setpoints being withheld during the roughly 2 s pre-Offboard stream.
 
 | Observed measurement | Value |
 | --- | --- |
-| Maximum height above initial ground | 2.080 m |
-| Initial hover stable window | 5.045 s |
-| Initial hover position RMS error | 0.074 m |
-| Second hover stable window | 5.008 s |
-| Second hover position RMS error | 0.121 m |
+| Maximum height above initial ground | 2.056 m |
+| Initial hover stable window | 5.039 s |
+| Initial hover position RMS error | 0.083 m |
+| Second hover stable window | 5.036 s |
+| Second hover position RMS error | 0.125 m |
 | Second target displacement | North 1.0 m, East 0.5 m, yaw +0.25 rad |
 | Final landing | PX4 native NAV_LAND, land detection and ground disarm observed |
 
 All three nonzero body-rate axes and positive thrust were observed at the PX4 ROS input, and actual measured motion satisfied the hold criteria. Offboard, arm and land commands received accepted PX4 acknowledgements. No preflight/failsafe parameters were disabled or force-arming used.
 
-The test keeps odometry freshness at 0.5 s and allows 1.5 s for VehicleStatus: PX4 Commander normally publishes unchanged status at 2 Hz (`Commander.cpp`), so a 0.5 s status timeout would reject normal operation. The 0.60 initial hover estimate did not lift this motor model; the model-derived calibration above is required. The C++ migration did not change the flight script, acceptance criteria or PX4 safety parameters.
+The test keeps odometry freshness at 0.5 s and allows 1.5 s for VehicleStatus: PX4 Commander normally publishes unchanged status at 2 Hz (`Commander.cpp`), so a 0.5 s status timeout would reject normal operation. The 0.60 initial hover estimate did not lift this motor model; the model-derived calibration above is required. Neither the flight script, acceptance criteria nor PX4 safety parameters were changed.
