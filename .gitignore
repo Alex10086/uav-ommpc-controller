@@ -1,0 +1,16 @@
+# ROS 2 / colcon generated output
+/build/
+/install/
+/log/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+
+# Flight and experiment recordings
+*.ulg
+*.bag
+*.mcap

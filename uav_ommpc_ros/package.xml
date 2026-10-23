@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>uav_ommpc_ros</name>
+  <version>0.1.0</version>
+  <description>Minimal ROS 2 body-rate and thrust bridge to PX4.</description>
+  <maintainer email="maintainer@uav-ommpc-controller.invalid">xerolab</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>px4_msgs</exec_depend>
+  <exec_depend>uav_ommpc_interfaces</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
