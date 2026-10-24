@@ -1,6 +1,100 @@
-# UAV OMMPC ROS 2 / PX4 bridge
+# UAV OMMPC mathematics and ROS 2 / PX4 bridge
 
 Minimal ROS 2 Jazzy **C++17 / rclcpp** communication packages for PX4 v1.17. This repository does **not** implement the user's OMMPC algorithm. An external controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs. The Python bridge has been removed; `ros2 run uav_ommpc_ros px4_bridge` and all public topics, messages, QoS and startup parameters remain unchanged. Only the SITL test utilities use Python.
+
+`uav_ommpc_controller` supplies the standalone C++17/Eigen mathematical primitives described below. It does not yet supply an MPC optimizer or flight controller, and is not connected to the bridge.
+
+## OMMPC mathematics (no ROS dependency)
+
+Header: `uav_ommpc_controller/include/uav_ommpc_controller/so3_math.hpp`.
+All functions are inline, use fixed-size `Eigen::Vector3d` / `Eigen::Matrix3d`, and operate in double precision. Eigen is the only library dependency; GoogleTest is required only when building tests.
+
+### Definitions and conventions
+
+`SO(3)` is the group of rotation matrices (`R.transpose() * R = I`, `det(R) = 1`); `so(3)` is its Lie algebra of skew-symmetric matrices. A rotation vector `phi = angle * axis` belongs to R³ and is **not** an Euler-angle vector. Rotations are right-handed and active, act on column vectors, and use radians.
+
+Namespaces below are relative to `uav_ommpc_controller`:
+
+| API | Formula / purpose |
+| --- | --- |
+| `r3::boxplus(x, delta)` | `x + delta` for Euclidean position/velocity components |
+| `r3::boxminus(x, reference)` | `x - reference`, actual minus reference |
+| `so3::hat(v)` | `[v]×`, with `[v]× w = v × w` |
+| `so3::vee(S)` | Inverse of `hat`; input must be skew-symmetric |
+| `so3::exp(phi)` | `I + sin(theta)/theta * S + (1-cos(theta))/theta² * S²`, where `S = hat(phi)`, `theta = norm(phi)` |
+| `so3::log(R)` | Principal rotation vector, norm in `[0, pi]` |
+| `so3::boxplus(R, delta)` | `R * Exp(delta)`, right/body-local perturbation |
+| `so3::boxminus(R, R_ref)` | `Log(R_ref.transpose() * R)`, actual relative to reference |
+| `so3::left_jacobian(phi)` | `J_l = I + (1-cos(theta))/theta² * S + (theta-sin(theta))/theta³ * S²` |
+| `so3::right_jacobian(phi)` | `J_r(phi) = J_l(-phi) = J_l(phi).transpose()` |
+
+The Jacobians distinguish additive rotation-vector changes from local rotational increments:
+
+```text
+Exp(phi + d) = Exp(J_l(phi) * d) * Exp(phi) + O(norm(d)^2)
+            = Exp(phi) * Exp(J_r(phi) * d) + O(norm(d)^2)
+```
+
+For a body-to-world rotation, body angular velocity `omega_body` advances attitude as
+`R_next = boxplus(R, omega_body * dt)`. This is exact for constant body angular velocity over the interval. No NED/ENU or FRD/FLU conversion is performed here.
+
+For `norm(phi) < 1e-3`, `exp` and the Jacobians use Taylor coefficients through `theta^4` to avoid division by zero and cancellation. Away from zero, `1-cos(theta)` is evaluated as `2*sin(theta/2)^2`. `log` uses Eigen's quaternion-based `AngleAxisd` extraction to avoid dividing by `sin(theta)` near pi. Unlike the reference's first-order tiny-angle exponential, this implementation retains the quadratic Rodrigues term.
+
+**Domain:** inputs must be finite and rotation matrices must already be in SO(3); `vee` expects so(3). These primitives do not validate, normalize or project invalid inputs. Rotation vectors are intended for ordinary control-scale angles, not extreme floating-point magnitudes. `log(exp(phi)) == phi` is a local identity for `norm(phi) < pi`, not a global one. At exactly pi the axis sign is ambiguous, and the principal logarithm is discontinuous across that branch cut. Do not use `I + hat(delta)` as a finite rotation matrix; it is only the first-order approximation.
+
+### Example
+
+```cpp
+#include <uav_ommpc_controller/so3_math.hpp>
+
+namespace so3 = uav_ommpc_controller::so3;
+const Eigen::Matrix3d R_ref = so3::exp(Eigen::Vector3d(0.2, -0.1, 0.3));
+const Eigen::Vector3d delta(0.001, -0.002, 0.003);
+const Eigen::Matrix3d R = so3::boxplus(R_ref, delta);
+const Eigen::Vector3d error = so3::boxminus(R, R_ref);  // recovers delta
+const Eigen::Vector3d omega_body(0.1, -0.2, 0.3);       // rad/s
+const Eigen::Matrix3d R_next = so3::boxplus(R, omega_body * 0.01);
+```
+
+### Build and test
+
+Standalone, without sourcing ROS (Ubuntu development packages: `libeigen3-dev`, `libgtest-dev`):
+
+```bash
+cd ~/uav_control_ws
+cmake -S src/uav-ommpc-controller/uav_ommpc_controller -B so3-math-build \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build so3-math-build -j2
+ctest --test-dir so3-math-build --output-on-failure
+```
+
+Or integrate the pure-CMake package into the existing colcon workspace:
+
+```bash
+cd ~/uav_control_ws
+colcon build --packages-select uav_ommpc_controller \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+colcon test --packages-select uav_ommpc_controller
+colcon test-result --verbose --test-result-base build/uav_ommpc_controller
+```
+
+An independent CMake consumer can set `CMAKE_PREFIX_PATH` to
+`~/uav_control_ws/install/uav_ommpc_controller`, then use:
+
+```cmake
+find_package(uav_ommpc_controller CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE uav_ommpc_controller::uav_ommpc_controller)
+```
+
+On Jetson, all 13 tests passed in both standalone Release and colcon builds. Coverage includes hat/vee and cross products, Euclidean errors, right-handed quarter turns, zero/tiny rotations, the Taylor-branch boundary, pi and both sides of its branch cut, 500 seeded rotation round trips, right-local error direction, finite-difference Jacobians, vector-action derivatives, and 10,000 consecutive body-rate updates.
+
+An independent Release-mode CMake consumer also built against the installed package without sourcing ROS. With Eigen heap allocation disabled and assertions enabled, it recovered `[0.001, -0.002, 0.003]` rad with error `2.76e-17`; 1,000 body-rate updates differed from the closed-form rotation by `6.72e-14` in matrix Frobenius norm. The temporary consumer was removed after verification.
+
+### Mathematical sources
+
+- G. Lu, W. Xu and F. Zhang, [On-Manifold Model Predictive Control for Trajectory Tracking on Robotic Systems](https://doi.org/10.1109/TIE.2022.3212397), IEEE TIE 70(9), 9192–9202, 2023.
+- The accessible author [preprint](https://arxiv.org/html/2106.15233v1), titled *Model Predictive Control for Trajectory Tracking on Differentiable Manifolds*: Section III-D defines Euclidean and Lie-group boxplus/boxminus; Section V defines actual-minus-reference error states. These section references are to the preprint, not verified journal-version equation numbers. Rodrigues' formula is written explicitly above with the quadratic term divided by `theta²`.
+- Engineering reference: [`refact-decouple/ommpc_core/include/ommpc_core/so3_math.h`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/include/ommpc_core/so3_math.h) and its [quadrotor derivation](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/OMMPC_derivation.pdf). This implementation uses the same hat/vee and left-Jacobian conventions, with explicit local-error operations and small-angle tests.
 
 ## Build and environment
 
