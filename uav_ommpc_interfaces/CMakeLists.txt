@@ -7,8 +7,8 @@ find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ThrustRates.msg"
-  "msg/ReferenceState.msg"
-  "msg/ReferenceTrajectory.msg"
+  "msg/PolynomialSegment.msg"
+  "msg/PolynomialTrajectory.msg"
   DEPENDENCIES std_msgs
 )
 

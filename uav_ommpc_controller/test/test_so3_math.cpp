@@ -46,6 +46,7 @@ TEST(So3Math, IdentityAndZeroLimits)
   EXPECT_EQ(so3::log(identity).norm(), 0.0);
   EXPECT_EQ((so3::left_jacobian(zero) - identity).norm(), 0.0);
   EXPECT_EQ((so3::right_jacobian(zero) - identity).norm(), 0.0);
+  EXPECT_EQ((so3::right_jacobian_inverse(zero) - identity).norm(), 0.0);
 }
 
 TEST(So3Math, PositiveQuarterTurnsAreRightHanded)
@@ -171,6 +172,26 @@ TEST(So3Math, JacobiansMatchLeftAndRightFiniteDifferences)
     }
     EXPECT_LT((so3::left_jacobian(phi) - left_difference).norm(), 1e-9);
     EXPECT_LT((so3::right_jacobian(phi) - right_difference).norm(), 1e-9);
+  }
+}
+
+TEST(So3Math, RightJacobianInverseMatchesLogDerivativeAndMatrixInverse)
+{
+  const Vector3d axis = Vector3d(1.0, -2.0, 3.0).normalized();
+  constexpr double h = 1e-6;
+  for (double theta : {0.0, 1e-10, 0.000999999, 0.001, 0.001000001, 0.7, kPi - 0.002})
+  {
+    const Vector3d phi = theta * axis;
+    const Matrix3d inverse = so3::right_jacobian_inverse(phi);
+    EXPECT_LT((inverse * so3::right_jacobian(phi) - Matrix3d::Identity()).norm(), 2e-14);
+    Matrix3d numeric;
+    for (int column = 0; column < 3; ++column)
+    {
+      numeric.col(column) =
+        (so3::log(so3::exp(phi) * so3::exp(h * Vector3d::Unit(column))) -
+        so3::log(so3::exp(phi) * so3::exp(-h * Vector3d::Unit(column)))) / (2.0 * h);
+    }
+    EXPECT_LT((inverse - numeric).norm(), 2e-9);
   }
 }
 

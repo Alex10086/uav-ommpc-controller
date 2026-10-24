@@ -14,13 +14,16 @@ namespace
 {
 using linearization::InputError;
 using linearization::StateError;
-constexpr double kReferenceTolerance = 1e-6;
 constexpr double kConstraintTolerance = 1e-4;
 
 Settings checked_settings(const Settings &s)
 {
   if (s.horizon < 1 || s.horizon > 100 || !std::isfinite(s.dt) || s.dt <= 0.0 ||
     !std::isfinite(s.gravity) || s.gravity <= 0.0 ||
+    !std::isfinite(s.max_position_defect) || s.max_position_defect <= 0.0 ||
+    !std::isfinite(s.max_velocity_defect) || s.max_velocity_defect <= 0.0 ||
+    !std::isfinite(s.max_attitude_defect) || s.max_attitude_defect <= 0.0 ||
+    s.max_attitude_defect >= 3.14159265358979323846 - 1e-3 ||
     !s.state_weights.allFinite() || (s.state_weights.array() < 0.0).any() ||
     !s.terminal_weights.allFinite() || (s.terminal_weights.array() < 0.0).any() ||
     !s.input_weights.allFinite() || (s.input_weights.array() <= 0.0).any() ||
@@ -54,6 +57,7 @@ struct Controller::Impl
   const Settings settings;
   const int n;
   CondensedQp qp;
+  std::vector<linearization::LinearModel> models;
   Eigen::VectorXd state_weights, input_weights, free_response, weighted_free;
   Eigen::VectorXd weighted_column;
   Eigen::VectorXd delta_u, delta_x, previous_controls, warm_primal, warm_dual;
@@ -66,8 +70,9 @@ struct Controller::Impl
   : settings(checked_settings(config)), n(4 * settings.horizon),
     qp{Eigen::MatrixXd::Zero(9 * settings.horizon, n),
       Eigen::MatrixXd::Zero(9 * settings.horizon, 9), Eigen::MatrixXd::Zero(n, n),
+      Eigen::VectorXd::Zero(9 * settings.horizon),
       Eigen::VectorXd::Zero(n), Eigen::VectorXd(n), Eigen::VectorXd(n)},
-    state_weights(9 * settings.horizon), input_weights(n),
+    models(settings.horizon), state_weights(9 * settings.horizon), input_weights(n),
     free_response(9 * settings.horizon), weighted_free(9 * settings.horizon),
     weighted_column(9 * settings.horizon), delta_u(n), delta_x(9 * settings.horizon),
     previous_controls(n), warm_primal(n), warm_dual(Eigen::VectorXd::Zero(n)),
@@ -129,7 +134,7 @@ struct Controller::Impl
   }
 
   Status validate(const dynamics::State &actual, const std::vector<dynamics::State> &reference,
-    const std::vector<dynamics::ControlInput> &feedforward) const
+    const std::vector<dynamics::ControlInput> &feedforward)
   {
     if (reference.size() != static_cast<std::size_t>(settings.horizon + 1) ||
       feedforward.size() != static_cast<std::size_t>(settings.horizon) || !valid_state(actual))
@@ -145,32 +150,37 @@ struct Controller::Impl
       const InputError input = input_vector(feedforward[k]);
       if (!input.allFinite() || (input.array() < settings.input_min.array()).any() ||
         (input.array() > settings.input_max.array()).any()) return Status::InvalidInput;
-      const StateError defect = linearization::state_error(
-        dynamics::predict_step(reference[k], feedforward[k], settings.dt, settings.gravity), reference[k + 1]);
-      if (!defect.allFinite() || defect.head<3>().norm() > kReferenceTolerance ||
-        defect.segment<3>(3).norm() > kReferenceTolerance || defect.tail<3>().norm() > kReferenceTolerance)
+      models[k] = linearization::linearize(
+        reference[k], feedforward[k], reference[k + 1], settings.dt, settings.gravity);
+      const StateError &defect = models[k].d;
+      if (!defect.allFinite() || defect.head<3>().norm() > settings.max_position_defect ||
+        defect.segment<3>(3).norm() > settings.max_velocity_defect ||
+        defect.tail<3>().norm() > settings.max_attitude_defect)
       {
-        return Status::ReferenceMismatch;
+        return Status::ReferenceOutOfDomain;
       }
     }
     return Status::Solved;
   }
 
-  void condense(const StateError &initial_error, const std::vector<dynamics::State> &reference,
+  void condense(const StateError &initial_error,
     const std::vector<dynamics::ControlInput> &feedforward)
   {
     // Rows are x1..xN. Only causal blocks are written; future-input blocks stay zero.
     for (int k = 0; k < settings.horizon; ++k)
     {
-      const auto model = linearization::linearize(reference[k], feedforward[k], settings.dt);
+      const auto &model = models[k];
       if (k == 0)
       {
         qp.H.topRows<9>() = model.A;
+        qp.D.head<9>() = model.d;
       }
       else
       {
         qp.H.middleRows<9>(9 * k).noalias() = model.A * qp.H.middleRows<9>(9 * (k - 1));
         qp.M.block(9 * k, 0, 9, 4 * k).noalias() = model.A * qp.M.block(9 * (k - 1), 0, 9, 4 * k);
+        qp.D.segment<9>(9 * k).noalias() = model.A * qp.D.segment<9>(9 * (k - 1));
+        qp.D.segment<9>(9 * k) += model.d;
       }
       qp.M.block<9, 4>(9 * k, 4 * k) = model.B;
       const InputError nominal = input_vector(feedforward[k]);
@@ -184,6 +194,7 @@ struct Controller::Impl
         .cwiseMax(qp.lower.segment<4>(4 * k)).cwiseMin(qp.upper.segment<4>(4 * k));
     }
     free_response.noalias() = qp.H * initial_error;
+    free_response += qp.D;
     weighted_free = state_weights.cwiseProduct(free_response);
     c_int entry = 0;
     for (int column = 0; column < n; ++column)
@@ -220,7 +231,7 @@ Result Controller::solve(const dynamics::State &actual, const std::vector<dynami
     w.invalidate_solution();
     return result;
   }
-  w.condense(linearization::state_error(actual, reference.front()), reference, feedforward);
+  w.condense(linearization::state_error(actual, reference.front()), feedforward);
   result.status = Status::SolverFailure;
   if (!w.qp.P.allFinite() || !w.qp.q.allFinite() || !w.qp.lower.allFinite() || !w.qp.upper.allFinite() ||
     osqp_update_P(w.workspace.get(), w.p_values.data(), nullptr, static_cast<c_int>(w.p_values.size())) != 0 ||

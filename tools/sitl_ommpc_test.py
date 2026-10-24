@@ -26,10 +26,10 @@ from px4_msgs.msg import (VehicleOdometry, VehicleStatus, VehicleCommand,
                           VehicleCommandAck, VehicleLandDetected,
                           VehicleRatesSetpoint, OffboardControlMode)
 from uav_ommpc_interfaces.msg import ThrustRates
-from reference_test_publisher import ReferencePublisher
+from reference_test_publisher import ReferencePublisher, sample_reference
 
 MODES = ('hover', 'target_step', 'constant_velocity', 'circle')
-TOPICS = ('/uav/reference_trajectory', '/uav/state', '/uav/status',
+TOPICS = ('/uav/reference_polynomial', '/uav/state', '/uav/status',
           '/uav/control_input', '/uav/vehicle_command', '/uav/command_ack',
           '/fmu/out/vehicle_odometry', '/fmu/out/vehicle_status_v1',
           '/fmu/out/vehicle_command_ack', '/fmu/out/vehicle_land_detected',
@@ -37,8 +37,8 @@ TOPICS = ('/uav/reference_trajectory', '/uav/state', '/uav/status',
           '/fmu/in/vehicle_command')
 TRACE_FIELDS = ('time_s phase px4_timestamp_us north_m east_m down_m vn_m_s '
                 've_m_s vd_m_s qw qx qy qz ref_n_m ref_e_m ref_d_m ref_vn_m_s '
-                'ref_ve_m_s ref_vd_m_s ref_qw ref_qx ref_qy ref_qz reference_index '
-                'reference_stamp_ns reference_sample_age_s position_error_m '
+                'ref_ve_m_s ref_vd_m_s ref_qw ref_qx ref_qy ref_qz '
+                'reference_stamp_ns reference_elapsed_s position_error_m '
                 'velocity_error_m_s speed_m_s tilt_rad yaw_error_rad '
                 'input_thrust_m_s2 input_roll_rad_s input_pitch_rad_s input_yaw_rad_s '
                 'bridge_roll_rad_s bridge_pitch_rad_s bridge_yaw_rad_s bridge_thrust_z '
@@ -71,7 +71,7 @@ def finite_or_none(value):
 
 class Flight(ReferencePublisher):
     def __init__(self, out, modes):
-        super().__init__(mode='hover', origin=None, yaw=None, dt=.02, samples=60,
+        super().__init__(mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
                          rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
                          start_delay=2., ramp=3., line_duration=8.,
                          direction=(1., 0., 0.), node_name='sitl_ommpc_test')
@@ -81,6 +81,7 @@ class Flight(ReferencePublisher):
         self.f_phase = 'initializing'
         self.f_state = self.f_status = self.f_land = None
         self.f_state_at = self.f_status_at = self.f_land_at = -math.inf
+        self.f_state_ros_ns = None
         self.f_input = self.f_rates = None
         self.f_input_at = self.f_rates_at = -math.inf
         self.f_raw_state_at = self.f_raw_status_at = -math.inf
@@ -129,7 +130,7 @@ class Flight(ReferencePublisher):
         self.f_trace_writer = self.f_csv('trace.csv', TRACE_FIELDS)
         self.f_input_writer = self.f_csv('control_input.csv', ['time_s', 'phase', 'thrust_acceleration', 'roll', 'pitch', 'yaw', 'gap_s', 'bounds_valid'])
         self.f_rates_writer = self.f_csv('bridge_rates.csv', ['time_s', 'phase', 'timestamp_us', 'roll', 'pitch', 'yaw', 'thrust_x', 'thrust_y', 'thrust_z', 'gap_s', 'bounds_valid'])
-        self.f_ref_writer = self.f_csv('reference.csv', ['time_s', 'phase', 'stamp_ns', 'dt', 'index', 'north', 'east', 'down', 'vn', 've', 'vd', 'qw', 'qx', 'qy', 'qz', 'thrust', 'roll', 'pitch', 'yaw'])
+        self.f_ref_writer = self.f_csv('reference.csv', ['time_s', 'phase', 'stamp_ns', 'elapsed_s', 'north', 'east', 'down', 'vn', 've', 'vd', 'qw', 'qx', 'qy', 'qz', 'thrust', 'roll', 'pitch', 'yaw'])
 
     def f_csv(self, name, fields):
         file = (self.f_out/name).open('w', newline='')
@@ -156,6 +157,7 @@ class Flight(ReferencePublisher):
             return
         self.f_last_state_stamp = int(msg.timestamp)
         self.f_state, self.f_state_at = msg, time.monotonic()
+        self.f_state_ros_ns = self.get_clock().now().nanoseconds
         self.f_counts['state'] += 1
         self.f_advances += 1
         if self.f_ground is not None:
@@ -227,35 +229,35 @@ class Flight(ReferencePublisher):
         if msg.body_rate and not any((msg.position, msg.velocity, msg.acceleration, msg.attitude)):
             self.f_counts['heartbeat'] += 1
 
-    def f_reference(self):
+    def f_reference(self, receipt_ns=None):
         ref = self.last_reference
-        if ref is None or not ref.states or ref.dt <= 0.:
+        if ref is None:
             return None
-        now_ns = self.get_clock().now().nanoseconds
-        age = (now_ns-stamp_ns(ref.header.stamp))*1e-9
-        # Use the current grid interval, exactly as the controller does.
-        index = int(math.floor(age/ref.dt))
-        if age < -.001 or index < 0 or index >= len(ref.states):
+        now_ns = self.get_clock().now().nanoseconds if receipt_ns is None else receipt_ns
+        elapsed = (now_ns-stamp_ns(ref.header.stamp))*1e-9
+        try:
+            desired = sample_reference(ref, elapsed)
+        except (ValueError, ArithmeticError):
             return None
-        return ref.states[index], index, age-index*ref.dt, stamp_ns(ref.header.stamp)
+        return desired, elapsed, stamp_ns(ref.header.stamp)
 
     def f_record_reference(self):
         ref = self.last_reference
-        if ref is None or ref is self.f_last_reference:
+        if ref is None or self.last_publish_ns == self.f_last_reference:
             return
-        self.f_last_reference = ref
+        self.f_last_reference = self.last_publish_ns
         self.f_counts['reference'] += 1
-        for i, state in enumerate(ref.states):
-            control = ref.inputs[i] if i < len(ref.inputs) else None
-            inputs = [control.thrust_acceleration, *control.body_rates] if control is not None else ['', '', '', '']
-            self.f_ref_writer.writerow([self.f_time(), self.f_phase, stamp_ns(ref.header.stamp), ref.dt, i,
-                                       *state.position, *state.velocity, *state.q, *inputs])
+        elapsed = (self.last_publish_ns-stamp_ns(ref.header.stamp))*1e-9
+        desired = sample_reference(ref, elapsed)
+        self.f_ref_writer.writerow([self.f_time(), self.f_phase, stamp_ns(ref.header.stamp), elapsed,
+                                   *desired.position, *desired.velocity, *desired.q,
+                                   desired.thrust_acceleration, *desired.body_rates])
 
     def f_record_state(self):
-        selected = self.f_reference()
+        selected = self.f_reference(self.f_state_ros_ns)
         if selected is None:
             return
-        desired, index, age, reference_stamp = selected
+        desired, elapsed, reference_stamp = selected
         state = self.f_state
         R, Rd = rotation(state.q), rotation(desired.q)
         yaw = math.atan2(R[1, 0], R[0, 0])
@@ -269,7 +271,7 @@ class Flight(ReferencePublisher):
         control = self.f_input if self.f_input is not None else [math.nan]*4
         rates = self.f_rates if self.f_rates is not None else [math.nan]*6
         row = [self.f_time(), self.f_phase, int(state.timestamp), *state.position, *state.velocity, *state.q,
-               *desired.position, *desired.velocity, *desired.q, index, reference_stamp, age,
+               *desired.position, *desired.velocity, *desired.q, reference_stamp, elapsed,
                error, velocity_error, speed, tilt, yaw_error, *control, *rates[:3], rates[5],
                now-self.f_input_at, now-self.f_rates_at, now-self.f_state_at, now-self.f_status_at,
                int(self.f_status.nav_state) if self.f_status else -1,

@@ -4,12 +4,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include <Eigen/Geometry>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
-#include <uav_ommpc_interfaces/msg/reference_state.hpp>
+#include <uav_ommpc_interfaces/msg/polynomial_trajectory.hpp>
 
 #include "uav_ommpc_controller/dynamic.hpp"
+#include "uav_ommpc_controller/polynomial_reference.hpp"
 
 namespace uav_ommpc_ros
 {
@@ -45,41 +50,39 @@ inline bool decode_odometry(
   return true;
 }
 
-inline bool decode_reference(
-  const uav_ommpc_interfaces::msg::ReferenceState &message,
-  uav_ommpc_controller::dynamics::State &out)
+// Decode once on receipt; constructor validation is shared with the pure sampler.
+// Invalid replacements throw and must invalidate the caller's previous plan.
+inline std::unique_ptr<const uav_ommpc_controller::reference::PolynomialReference>
+decode_polynomial(
+  const uav_ommpc_interfaces::msg::PolynomialTrajectory &message,
+  std::int64_t &start_ns, double gravity)
 {
-  uav_ommpc_controller::dynamics::State state;
-  for (std::size_t i = 0; i < 3; ++i) {
-    state.p[i] = message.position[i];
-    state.v[i] = message.velocity[i];
+  if (message.header.frame_id != "ned" || message.header.stamp.sec < 0 ||
+      message.header.stamp.nanosec >= 1000000000u) {
+    throw std::invalid_argument("Invalid polynomial frame or timestamp");
   }
-  Eigen::Quaterniond q(message.q[0], message.q[1], message.q[2], message.q[3]);
-  const double norm = q.norm();
-  if (!state.p.allFinite() || !state.v.allFinite() ||
-      !q.coeffs().allFinite() || !std::isfinite(norm) || std::abs(norm - 1.0) > 1e-6) {
-    return false;
+  const auto start = static_cast<std::int64_t>(message.header.stamp.sec) * 1000000000LL +
+    message.header.stamp.nanosec;
+  if (start <= 0 || message.segments.empty() || message.segments.size() > 100) {
+    throw std::invalid_argument("Invalid polynomial start or segment count");
   }
-  q.normalize();
-  state.R = q.toRotationMatrix();
-  out = state;
-  return true;
+  std::vector<uav_ommpc_controller::reference::Segment> segments;
+  segments.reserve(message.segments.size());
+  for (const auto &source : message.segments) {
+    segments.push_back({source.duration,
+      {source.x.begin(), source.x.end()}, {source.y.begin(), source.y.end()},
+      {source.z.begin(), source.z.end()}, {source.yaw.begin(), source.yaw.end()}});
+  }
+  auto result = std::make_unique<const uav_ommpc_controller::reference::PolynomialReference>(
+    std::move(segments), message.hold_final, gravity);
+  start_ns = start;
+  return result;
 }
 
-inline std::optional<std::size_t> reference_index(
-  std::int64_t now_ns, std::int64_t start_ns, std::int64_t dt_ns,
-  std::size_t input_count, std::size_t horizon)
+inline std::optional<double> reference_elapsed(std::int64_t now_ns, std::int64_t start_ns)
 {
-  if (now_ns <= 0 || start_ns <= 0 || now_ns < start_ns || dt_ns <= 0 ||
-      horizon == 0 || input_count < horizon) {
-    return std::nullopt;
-  }
-  // Positive ordered timestamps make subtraction safe. Compare the remaining
-  // capacity instead of adding horizon to index, which could overflow.
-  const auto index = static_cast<std::uint64_t>((now_ns - start_ns) / dt_ns);
-  if (index > input_count - horizon) {
-    return std::nullopt;
-  }
-  return static_cast<std::size_t>(index);
+  if (start_ns <= 0 || now_ns < start_ns) return std::nullopt;
+  // Positive ordered timestamps keep the subtraction within int64 range.
+  return static_cast<double>(now_ns - start_ns) * 1e-9;
 }
 }  // namespace uav_ommpc_ros

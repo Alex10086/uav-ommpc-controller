@@ -115,5 +115,23 @@ inline Eigen::Matrix3d right_jacobian(const Eigen::Vector3d &phi)
 {
   return left_jacobian(-phi);
 }
+
+// Derivative of Log(Exp(phi) * Exp(delta)) at delta=0; ||phi|| < pi.
+inline Eigen::Matrix3d right_jacobian_inverse(const Eigen::Vector3d &phi)
+{
+  const double theta2 = phi.squaredNorm();
+  double coefficient;
+  if (theta2 < 1e-6)
+  {
+    coefficient = 1.0 / 12.0 + theta2 / 720.0 + theta2 * theta2 / 30240.0;
+  }
+  else
+  {
+    const double half_theta = 0.5 * std::sqrt(theta2);
+    coefficient = (1.0 - half_theta / std::tan(half_theta)) / theta2;
+  }
+  const Eigen::Matrix3d skew = hat(phi);
+  return Eigen::Matrix3d::Identity() + 0.5 * skew + coefficient * (skew * skew);
+}
 }  // namespace so3
 }  // namespace uav_ommpc_controller

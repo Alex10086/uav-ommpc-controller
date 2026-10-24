@@ -8,14 +8,17 @@
 #include <limits>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 #include "uav_ommpc_controller/ommpc.hpp"
+#include "uav_ommpc_controller/polynomial_reference.hpp"
 
 namespace
 {
 namespace dynamics = uav_ommpc_controller::dynamics;
 namespace ommpc = uav_ommpc_controller::ommpc;
 namespace so3 = uav_ommpc_controller::so3;
+namespace polynomial = uav_ommpc_controller::reference;
 
 bool finite(const dynamics::State &state)
 {
@@ -55,91 +58,100 @@ struct ErrorStatistics
   }
 };
 
-int run()
+Eigen::Matrix<double, 4, 3> circle_derivatives(double t)
 {
-  const ommpc::Settings settings;
-  constexpr double radius = 5.0;
-  constexpr double speed = 5.0;
-  constexpr double altitude = 2.0;
-  constexpr double duration = 12.0;
+  // Radius=5 m, angular speed=1 rad/s: genuine continuous derivatives.
+  const double c = std::cos(t), s = std::sin(t);
+  Eigen::Matrix<double, 4, 3> values;
+  values << 5.0*c, 5.0*s, -2.0,
+    -5.0*s, 5.0*c, 0.0,
+    -5.0*c, -5.0*s, 0.0,
+    5.0*s, -5.0*c, 0.0;
+  return values;
+}
+
+polynomial::PolynomialReference circle_reference(double duration)
+{
+  constexpr double piece_duration = 0.25;
+  const auto count = static_cast<std::size_t>(std::ceil(duration/piece_duration));
+  std::vector<polynomial::Segment> segments;
+  segments.reserve(count);
+  Eigen::Matrix4d inverse;
+  inverse << 35.0, -15.0, 2.5, -1.0/6.0,
+    -84.0, 39.0, -7.0, 0.5,
+    70.0, -34.0, 6.5, -0.5,
+    -20.0, 10.0, -2.0, 1.0/6.0;
+  for (std::size_t k = 0; k < count; ++k)
+  {
+    const auto left = circle_derivatives(k*piece_duration);
+    const auto right = circle_derivatives((k+1)*piece_duration);
+    Eigen::Matrix<double, 8, 3> coefficients;
+    coefficients.row(0) = left.row(0);
+    coefficients.row(1) = piece_duration*left.row(1);
+    coefficients.row(2) = piece_duration*piece_duration/2.0*left.row(2);
+    coefficients.row(3) = piece_duration*piece_duration*piece_duration/6.0*left.row(3);
+    Eigen::Matrix<double, 4, 3> residual;
+    residual.row(0) = right.row(0)-coefficients.topRows<4>().colwise().sum();
+    residual.row(1) = piece_duration*right.row(1)-coefficients.row(1)-
+      2.0*coefficients.row(2)-3.0*coefficients.row(3);
+    residual.row(2) = piece_duration*piece_duration*right.row(2)-
+      2.0*coefficients.row(2)-6.0*coefficients.row(3);
+    residual.row(3) = piece_duration*piece_duration*piece_duration*right.row(3)-
+      6.0*coefficients.row(3);
+    coefficients.bottomRows<4>().noalias() = inverse*residual;
+    polynomial::Segment segment;
+    segment.duration = piece_duration;
+    segment.x.resize(8);
+    segment.y.resize(8);
+    segment.z.resize(8);
+    segment.yaw = {0.0};
+    for (int i = 0; i < 8; ++i)
+    {
+      segment.x[i] = coefficients(i, 0);
+      segment.y[i] = coefficients(i, 1);
+      segment.z[i] = coefficients(i, 2);
+    }
+    segments.push_back(std::move(segment));
+  }
+  return polynomial::PolynomialReference(std::move(segments));
+}
+
+dynamics::State continuous_step(
+  const dynamics::State &state, const dynamics::ControlInput &input,
+  double dt, double gravity)
+{
+  constexpr int substeps = 20;
+  const double h = dt/substeps;
+  const auto acceleration = [&](double t) -> Eigen::Vector3d {
+    const Eigen::Matrix3d R = state.R*so3::exp(t*input.body_rates);
+    return gravity*Eigen::Vector3d::UnitZ()-input.thrust_acceleration*R.col(2);
+  };
+  dynamics::State next = state;
+  Eigen::Vector3d a0 = acceleration(0.0);
+  for (int i = 0; i < substeps; ++i)
+  {
+    const Eigen::Vector3d amid = acceleration((i+0.5)*h);
+    const Eigen::Vector3d aend = acceleration((i+1)*h);
+    // RK4 for p_dot=v, v_dot=a(t); a is independent of p and v.
+    next.p += h*next.v+(h*h/6.0)*(a0+2.0*amid);
+    next.v += (h/6.0)*(a0+4.0*amid+aend);
+    a0 = aend;
+  }
+  next.R = state.R*so3::exp(dt*input.body_rates);
+  return next;
+}
+
+bool run_plant(
+  bool continuous, const ommpc::Settings &settings,
+  const std::vector<dynamics::State> &states,
+  const std::vector<dynamics::ControlInput> &inputs, std::size_t steps)
+{
   constexpr double settling_time = 2.0;
   constexpr double violation_tolerance = 1e-4;
   constexpr double steady_rmse_limit = 0.15;
   constexpr double deadline_ms = 20.0;
-  const auto steps = static_cast<std::size_t>(std::ceil(duration / settings.dt));
   const auto horizon = static_cast<std::size_t>(settings.horizon);
-  const std::size_t state_count = steps + horizon + 1;
-  const double angular_speed = speed / radius;
-
-  std::cout << std::fixed << std::setprecision(9)
-            << "scope=nonlinear_discrete_model_only_no_ROS_no_PX4_no_hardware\n"
-            << "timing_scope=steady_clock_solve_calls_not_a_hard_real_time_guarantee\n"
-            << "trajectory=circle_fixed_altitude_fixed_yaw\n"
-            << "frame=NED_FRD\n"
-            << "radius_m=" << radius << '\n'
-            << "analytic_speed_m_s=" << speed << '\n'
-            << "altitude_m=" << altitude << '\n'
-            << "yaw_rad=0\n"
-            << "dt_s=" << settings.dt << '\n'
-            << "horizon=" << settings.horizon << '\n'
-            << "duration_s=" << steps * settings.dt << '\n'
-            << "steady_state_start_s=" << settling_time << '\n'
-            << "steady_state_rmse_limit_m=" << steady_rmse_limit << '\n'
-            << "deadline_ms=" << deadline_ms << '\n';
-
-  // Two extra positions supply forward differences through the final rotation.
-  std::vector<Eigen::Vector3d> positions(state_count + 2);
-  for (std::size_t k = 0; k < positions.size(); ++k)
-  {
-    const double phase = angular_speed * static_cast<double>(k) * settings.dt;
-    positions[k] = Eigen::Vector3d(radius * std::cos(phase),
-      radius * std::sin(phase), -altitude);
-  }
-
-  std::vector<dynamics::State> states(state_count);
-  std::vector<dynamics::ControlInput> inputs(state_count - 1);
-  for (std::size_t k = 0; k < states.size(); ++k)
-  {
-    auto &state = states[k];
-    state.p = positions[k];
-    state.v = (positions[k + 1] - positions[k]) / settings.dt;
-    const Eigen::Vector3d next_velocity = (positions[k + 2] - positions[k + 1]) / settings.dt;
-    const Eigen::Vector3d acceleration = (next_velocity - state.v) / settings.dt;
-    const Eigen::Vector3d thrust_vector =
-      settings.gravity * Eigen::Vector3d::UnitZ() - acceleration;
-    const double thrust = thrust_vector.norm();
-    state.R.col(2) = thrust_vector / thrust;
-    // The body X axis lies in the world XZ plane with positive X: yaw is zero.
-    state.R.col(0) = Eigen::Vector3d::UnitY().cross(state.R.col(2)).normalized();
-    state.R.col(1) = state.R.col(2).cross(state.R.col(0));
-    if (!finite(state) || !std::isfinite(thrust))
-      throw std::runtime_error("nonfinite reference state");
-    if (k < inputs.size())
-      inputs[k].thrust_acceleration = thrust;
-  }
-
-  double reference_violation = 0.0;
-  double reference_residual = 0.0;
-  for (std::size_t k = 0; k < inputs.size(); ++k)
-  {
-    inputs[k].body_rates = so3::log(states[k].R.transpose() * states[k + 1].R) / settings.dt;
-    if (!finite(inputs[k]))
-      throw std::runtime_error("nonfinite reference input");
-    reference_violation = std::max(reference_violation, input_violation(inputs[k], settings));
-    const auto next = dynamics::predict_step(states[k], inputs[k], settings.dt, settings.gravity);
-    const double residual = std::max({(next.p - states[k + 1].p).norm(),
-      (next.v - states[k + 1].v).norm(), so3::boxminus(next.R, states[k + 1].R).norm()});
-    if (!finite(next) || !std::isfinite(residual))
-      throw std::runtime_error("nonfinite reference dynamics residual");
-    reference_residual = std::max(reference_residual, residual);
-  }
-  std::cout << "reference_max_input_violation=" << reference_violation << '\n'
-            << "reference_max_dynamics_residual=" << reference_residual << '\n';
-  if (reference_violation > 0.0)
-    throw std::runtime_error("circle reference exceeds configured input bounds");
-  if (reference_residual > 1e-6)
-    throw std::runtime_error("circle reference is not discretely dynamically consistent");
-
+  std::cout << "plant=" << (continuous ? "continuous_ZOH_RK4_dt_over_20" : "Euler_discrete") << '\n';
   ommpc::Controller controller(settings);
   std::vector<dynamics::State> reference(horizon + 1);
   std::vector<dynamics::ControlInput> feedforward(horizon);
@@ -152,6 +164,8 @@ int run()
 
   ErrorStatistics all_errors;
   ErrorStatistics steady_errors;
+  ErrorStatistics all_velocity_errors;
+  ErrorStatistics steady_velocity_errors;
   double peak_speed = actual.v.norm();
   double max_violation = 0.0;
   std::size_t solver_failures = 0;
@@ -159,6 +173,7 @@ int run()
   std::size_t completed_steps = 0;
   bool nonfinite = false;
   all_errors.add((actual.p - states.front().p).norm());
+  all_velocity_errors.add((actual.v - states.front().v).norm());
 
   // All scenario buffers are allocated above; only the controller may allocate.
   for (std::size_t k = 0; k < steps; ++k)
@@ -189,18 +204,25 @@ int run()
     max_violation = std::max(max_violation, result.max_constraint_violation);
     if (max_violation > violation_tolerance)
       break;
-    actual = dynamics::predict_step(actual, *result.command, settings.dt, settings.gravity);
+    actual = continuous ?
+      continuous_step(actual, *result.command, settings.dt, settings.gravity) :
+      dynamics::predict_step(actual, *result.command, settings.dt, settings.gravity);
     const double error = (actual.p - states[k + 1].p).norm();
+    const double velocity_error = (actual.v - states[k + 1].v).norm();
     const double actual_speed = actual.v.norm();
-    if (!finite(actual) || !std::isfinite(error) || !std::isfinite(actual_speed))
+    if (!finite(actual) || !std::isfinite(error) || !std::isfinite(velocity_error) || !std::isfinite(actual_speed))
     {
       nonfinite = true;
       break;
     }
     ++completed_steps;
     all_errors.add(error);
+    all_velocity_errors.add(velocity_error);
     if (static_cast<double>(k + 1) * settings.dt >= settling_time)
+    {
       steady_errors.add(error);
+      steady_velocity_errors.add(velocity_error);
+    }
     peak_speed = std::max(peak_speed, actual_speed);
   }
 
@@ -216,6 +238,7 @@ int run()
   const double steady_rmse = steady_errors.rmse();
   const bool passed = completed_steps == steps && solver_failures == 0 && !nonfinite &&
     std::isfinite(all_rmse) && std::isfinite(steady_rmse) &&
+    std::isfinite(all_velocity_errors.rmse()) && std::isfinite(steady_velocity_errors.rmse()) &&
     max_violation <= violation_tolerance && steady_rmse <= steady_rmse_limit;
   std::cout << "completed_steps=" << completed_steps << '\n'
             << "position_samples_all=" << all_errors.count << '\n'
@@ -225,6 +248,10 @@ int run()
             << "position_max_error_all_m=" << all_errors.maximum << '\n'
             << "position_max_error_after_2s_m="
             << (steady_errors.count == 0 ? std::numeric_limits<double>::quiet_NaN() : steady_errors.maximum) << '\n'
+            << "velocity_rmse_all_m_s=" << all_velocity_errors.rmse() << '\n'
+            << "velocity_rmse_after_2s_m_s=" << steady_velocity_errors.rmse() << '\n'
+            << "velocity_max_error_all_m_s=" << all_velocity_errors.maximum << '\n'
+            << "velocity_max_error_after_2s_m_s=" << steady_velocity_errors.maximum << '\n'
             << "peak_speed_m_s=" << peak_speed << '\n'
             << "max_input_violation=" << max_violation << '\n'
             << "solver_failures=" << solver_failures << '\n'
@@ -234,7 +261,65 @@ int run()
             << "solve_time_p95_ms=" << percentile(0.95) << '\n'
             << "solve_time_max_ms=" << percentile(1.0) << '\n'
             << "deadline_misses_20ms=" << deadline_misses << '\n'
-            << "benchmark_pass=" << (passed ? 1 : 0) << '\n';
+            << "plant_pass=" << (passed ? 1 : 0) << '\n';
+  return passed;
+}
+
+int run()
+{
+  const ommpc::Settings settings;
+  constexpr double duration = 12.0;
+  const auto steps = static_cast<std::size_t>(std::ceil(duration/settings.dt));
+  const auto horizon = static_cast<std::size_t>(settings.horizon);
+  const std::size_t state_count = steps+horizon+1;
+  const auto trajectory = circle_reference((steps+horizon)*settings.dt+0.25);
+  std::vector<dynamics::State> states(state_count);
+  std::vector<dynamics::ControlInput> inputs(state_count-1);
+  for (std::size_t k = 0; k < state_count; ++k)
+  {
+    dynamics::ControlInput input;
+    if (!trajectory.sample(k*settings.dt, states[k], input))
+      throw std::runtime_error("analytic polynomial sample failed");
+    if (k < inputs.size())
+      inputs[k] = input;
+  }
+  Eigen::Vector3d max_defect = Eigen::Vector3d::Zero();
+  double reference_violation = 0.0;
+  for (std::size_t k = 0; k < inputs.size(); ++k)
+  {
+    if (!finite(states[k]) || !finite(inputs[k]))
+      throw std::runtime_error("nonfinite polynomial reference");
+    reference_violation = std::max(reference_violation, input_violation(inputs[k], settings));
+    const auto next = dynamics::predict_step(states[k], inputs[k], settings.dt, settings.gravity);
+    const Eigen::Vector3d defect{(next.p-states[k+1].p).norm(),
+      (next.v-states[k+1].v).norm(), so3::boxminus(next.R, states[k+1].R).norm()};
+    if (!finite(next) || !defect.allFinite())
+      throw std::runtime_error("nonfinite reference defect");
+    max_defect = max_defect.cwiseMax(defect);
+  }
+  std::cout << std::fixed << std::setprecision(9)
+            << "scope=analytic_polynomial_reference_two_model_plants_no_ROS_no_PX4_no_hardware\n"
+            << "timing_scope=steady_clock_solve_calls_not_a_hard_real_time_guarantee\n"
+            << "trajectory=degree7_C3_Hermite_circle_fixed_altitude_fixed_yaw\n"
+            << "frame=NED_FRD\nradius_m=5\nanalytic_speed_m_s=5\naltitude_m=2\nyaw_rad=0\n"
+            << "dt_s=" << settings.dt << '\n'
+            << "horizon=" << settings.horizon << '\n'
+            << "duration_s=" << steps*settings.dt << '\n'
+            << "steady_state_start_s=2\nsteady_state_rmse_limit_m=0.15\ndeadline_ms=20\n"
+            << "reference_max_input_violation=" << reference_violation << '\n'
+            << "reference_max_position_defect_m=" << max_defect.x() << '\n'
+            << "reference_max_velocity_defect_m_s=" << max_defect.y() << '\n'
+            << "reference_max_attitude_defect_rad=" << max_defect.z() << '\n';
+  if (reference_violation > 0.0)
+    throw std::runtime_error("circle reference exceeds configured input bounds");
+  if (max_defect.x() > settings.max_position_defect ||
+      max_defect.y() > settings.max_velocity_defect ||
+      max_defect.z() > settings.max_attitude_defect)
+    throw std::runtime_error("analytic circle reference exceeds configured affine model domain");
+  const bool discrete_pass = run_plant(false, settings, states, inputs, steps);
+  const bool continuous_pass = run_plant(true, settings, states, inputs, steps);
+  const bool passed = discrete_pass && continuous_pass;
+  std::cout << "benchmark_pass=" << (passed ? 1 : 0) << '\n';
   return passed ? 0 : 1;
 }
 }  // namespace

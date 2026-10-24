@@ -8,10 +8,10 @@
 #include "ommpc_inputs.hpp"
 
 using uav_ommpc_controller::dynamics::State;
-using uav_ommpc_interfaces::msg::ReferenceState;
+using uav_ommpc_interfaces::msg::PolynomialTrajectory;
 using uav_ommpc_ros::decode_odometry;
-using uav_ommpc_ros::decode_reference;
-using uav_ommpc_ros::reference_index;
+using uav_ommpc_ros::decode_polynomial;
+using uav_ommpc_ros::reference_elapsed;
 using Odometry = px4_msgs::msg::VehicleOdometry;
 
 namespace
@@ -27,12 +27,19 @@ Odometry odometry()
   return message;
 }
 
-ReferenceState reference()
+PolynomialTrajectory reference()
 {
-  ReferenceState message;
-  message.position = {1.0000000001, -2.0000000002, 3.0000000003};
-  message.velocity = {-4.0000000004, 5.0000000005, -6.0000000006};
-  message.q = {1.0, 0.0, 0.0, 0.0};
+  PolynomialTrajectory message;
+  message.header.frame_id = "ned";
+  message.header.stamp.sec = 12;
+  message.header.stamp.nanosec = 345;
+  message.segments.resize(1);
+  auto &segment = message.segments.front();
+  segment.duration = 2.0;
+  segment.x = {1.0000000001, 0.25};
+  segment.y = {-2.0000000002};
+  segment.z = {-3.0000000003};
+  segment.yaw = {0.123456789012345};
   return message;
 }
 
@@ -154,109 +161,114 @@ TEST(OmmpcOdometry, RejectsZeroNonunitAndNonfiniteQuaternions)
   }
 }
 
-TEST(OmmpcReference, PreservesDoublePrecisionAndHamiltonRotation)
+TEST(OmmpcPolynomial, DecodesNormalizedCoefficientsAndTimestamp)
+{
+  const auto message = reference();
+  std::int64_t start = 0;
+  const auto plan = decode_polynomial(message, start, 9.81);
+  EXPECT_EQ(start, 12000000345LL);
+  EXPECT_DOUBLE_EQ(plan->duration(), 2.0);
+  uav_ommpc_controller::reference::FlatSample sample;
+  ASSERT_TRUE(plan->sample_flat(1.0, sample));
+  EXPECT_DOUBLE_EQ(sample.p.x(), message.segments[0].x[0] + 0.125);
+  EXPECT_DOUBLE_EQ(sample.v.x(), 0.125);
+  EXPECT_DOUBLE_EQ(sample.p.y(), message.segments[0].y[0]);
+  EXPECT_DOUBLE_EQ(sample.p.z(), message.segments[0].z[0]);
+  EXPECT_DOUBLE_EQ(sample.yaw, message.segments[0].yaw[0]);
+}
+
+TEST(OmmpcPolynomial, RejectsMetadataWithoutChangingStart)
+{
+  const auto reject = [](const PolynomialTrajectory &message) {
+      std::int64_t start = 77;
+      EXPECT_THROW(decode_polynomial(message, start, 9.81), std::invalid_argument);
+      EXPECT_EQ(start, 77);
+    };
+  auto message = reference();
+  message.header.frame_id = "enu";
+  reject(message);
+  message = reference();
+  message.header.stamp.sec = -1;
+  reject(message);
+  message = reference();
+  message.header.stamp.nanosec = 1000000000u;
+  reject(message);
+  message = reference();
+  message.header.stamp.sec = 0;
+  message.header.stamp.nanosec = 0;
+  reject(message);
+  message = reference();
+  message.segments.clear();
+  reject(message);
+}
+
+TEST(OmmpcPolynomial, AppliesConstructorValidationAtReceipt)
+{
+  std::int64_t start = 77;
+  auto message = reference();
+  message.segments[0].x.clear();
+  EXPECT_THROW(decode_polynomial(message, start, 9.81), std::invalid_argument);
+  message = reference();
+  message.segments[0].duration = 0.0;
+  EXPECT_THROW(decode_polynomial(message, start, 9.81), std::invalid_argument);
+  message = reference();
+  message.segments[0].yaw[0] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_THROW(decode_polynomial(message, start, 9.81), std::invalid_argument);
+  message = reference();
+  message.segments.push_back(message.segments[0]);  // Position jumps back at the knot.
+  EXPECT_THROW(decode_polynomial(message, start, 9.81), std::invalid_argument);
+  message = reference();
+  message.hold_final = true;  // Nonzero terminal velocity cannot become a held hover.
+  EXPECT_THROW(decode_polynomial(message, start, 9.81), std::invalid_argument);
+  EXPECT_EQ(start, 77);
+}
+
+TEST(OmmpcPolynomial, DistinguishesFiniteGeometryAndExplicitFinalHold)
 {
   auto message = reference();
-  const double angle = 0.123456789012345;
-  message.q = {std::cos(angle / 2.0), 0.0, 0.0, std::sin(angle / 2.0)};
-  State out;
-  ASSERT_TRUE(decode_reference(message, out));
-  for (std::size_t axis = 0; axis < 3; ++axis) {
-    EXPECT_DOUBLE_EQ(out.p[axis], message.position[axis]);
-    EXPECT_DOUBLE_EQ(out.v[axis], message.velocity[axis]);
-  }
-  EXPECT_NEAR(out.R(0, 0), std::cos(angle), 1e-15);
-  EXPECT_NEAR(out.R(1, 0), std::sin(angle), 1e-15);
-  EXPECT_NEAR(out.R(0, 1), -std::sin(angle), 1e-15);
+  std::int64_t start = 0;
+  auto plan = decode_polynomial(message, start, 9.81);
+  State state;
+  uav_ommpc_controller::dynamics::ControlInput input;
+  EXPECT_TRUE(plan->sample(2.0, state, input));
+  EXPECT_FALSE(plan->sample(2.000001, state, input));
+  message.segments[0].x = {1.0};
+  message.hold_final = true;
+  plan = decode_polynomial(message, start, 9.81);
+  ASSERT_TRUE(plan->sample(1000.0, state, input));
+  EXPECT_DOUBLE_EQ(state.p.x(), 1.0);
+  EXPECT_TRUE(state.v.isZero());
+  EXPECT_NEAR(input.thrust_acceleration, 9.81, 1e-12);
 }
 
-TEST(OmmpcReference, NormalizesWithinDoubleTolerance)
+TEST(OmmpcPolynomialTime, UsesContinuousReceiptAnchorWithoutFlooring)
 {
-  for (const double scale : {0.9999995, 1.0000005, -1.0000005}) {
-    auto message = reference();
-    const double component = scale * std::sqrt(0.5);
-    message.q = {component, 0.0, component, 0.0};
-    State out;
-    ASSERT_TRUE(decode_reference(message, out));
-    EXPECT_TRUE((out.R * Eigen::Vector3d::UnitZ()).isApprox(Eigen::Vector3d::UnitX(), 1e-14));
-    EXPECT_NEAR(out.R.determinant(), 1.0, 1e-14);
-  }
+  constexpr std::int64_t start = 12000000345LL;
+  const auto elapsed = reference_elapsed(start + 19999999, start);
+  ASSERT_TRUE(elapsed);
+  EXPECT_NEAR(*elapsed, 0.019999999, 1e-16);
+  EXPECT_NEAR(*reference_elapsed(start + 20000001, start), 0.020000001, 1e-16);
+  auto message = reference();
+  std::int64_t decoded_start = 0;
+  const auto plan = decode_polynomial(message, decoded_start, 9.81);
+  std::vector<State> states(3);
+  std::vector<uav_ommpc_controller::dynamics::ControlInput> inputs(2);
+  ASSERT_TRUE(plan->sample_horizon(*elapsed, 0.02, states, inputs));
+  EXPECT_NEAR(states[0].p.x(), message.segments[0].x[0] + *elapsed * 0.125, 1e-14);
+  EXPECT_NEAR(states[2].p.x(), states[0].p.x() + 0.04 * 0.125, 1e-14);
+  EXPECT_FALSE(plan->sample_horizon(1.98, 0.02, states, inputs));
 }
 
-TEST(OmmpcReference, RejectsInvalidQuaternionsAndPreservesOutput)
+TEST(OmmpcPolynomialTime, RejectsFutureAndInvalidTimesWithoutOverflow)
 {
-  for (const double scalar : {0.0, 0.999998, 1.000002, std::numeric_limits<double>::max()}) {
-    auto message = reference();
-    message.q = {scalar, 0.0, 0.0, 0.0};
-    expect_rejected(message, decode_reference);
-  }
-  for (const double invalid : {std::numeric_limits<double>::quiet_NaN(),
-      std::numeric_limits<double>::infinity()}) {
-    for (std::size_t axis = 0; axis < 4; ++axis) {
-      auto message = reference();
-      message.q[axis] = invalid;
-      expect_rejected(message, decode_reference);
-    }
-  }
-}
-
-TEST(OmmpcReference, RejectsNonfinitePositionVelocityAndPreservesOutput)
-{
-  for (const double invalid : {std::numeric_limits<double>::quiet_NaN(),
-      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-      auto message = reference();
-      message.position[axis] = invalid;
-      expect_rejected(message, decode_reference);
-      message = reference();
-      message.velocity[axis] = invalid;
-      expect_rejected(message, decode_reference);
-    }
-  }
-}
-
-TEST(OmmpcReferenceIndex, FloorsExactNanosecondBoundaries)
-{
-  constexpr std::int64_t start = 123456789;
-  constexpr std::int64_t dt = 20000000;
-  EXPECT_EQ(reference_index(start, start, dt, 30, 20), 0u);
-  EXPECT_EQ(reference_index(start + dt - 1, start, dt, 30, 20), 0u);
-  EXPECT_EQ(reference_index(start + dt, start, dt, 30, 20), 1u);
-  EXPECT_EQ(reference_index(start + dt + 1, start, dt, 30, 20), 1u);
-  EXPECT_EQ(reference_index(start + 11 * dt - 1, start, dt, 30, 20), 10u);
-  EXPECT_FALSE(reference_index(start + 11 * dt, start, dt, 30, 20));
-}
-
-TEST(OmmpcReferenceIndex, RequiresWholeHorizonWithoutTerminalHold)
-{
-  EXPECT_EQ(reference_index(100, 100, 20, 20, 20), 0u);
-  EXPECT_EQ(reference_index(119, 100, 20, 20, 20), 0u);
-  EXPECT_FALSE(reference_index(120, 100, 20, 20, 20));
-  EXPECT_FALSE(reference_index(100, 100, 20, 19, 20));
-  EXPECT_FALSE(reference_index(100, 100, 20, 0, 20));
-  EXPECT_FALSE(reference_index(100, 100, 20, 20, 0));
-  EXPECT_FALSE(reference_index(100, 100, 20, 0, 0));
-}
-
-TEST(OmmpcReferenceIndex, RejectsFutureAndNonpositiveTimes)
-{
-  EXPECT_FALSE(reference_index(99, 100, 20, 30, 20));
-  for (const std::int64_t invalid : {std::int64_t{0}, std::int64_t{-1},
-      std::numeric_limits<std::int64_t>::min()}) {
-    EXPECT_FALSE(reference_index(invalid, 100, 20, 30, 20));
-    EXPECT_FALSE(reference_index(100, invalid, 20, 30, 20));
-    EXPECT_FALSE(reference_index(100, 100, invalid, 30, 20));
-  }
-}
-
-TEST(OmmpcReferenceIndex, AvoidsOverflowAtLargeTimestampsAndHorizons)
-{
-  constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
-  EXPECT_EQ(reference_index(maximum, maximum - 100, 10, 30, 20), 10u);
-  EXPECT_EQ(reference_index(maximum, 1, maximum, 20, 20), 0u);
-  EXPECT_EQ(reference_index(maximum, 1, maximum - 1, 21, 20), 1u);
-  EXPECT_FALSE(reference_index(maximum, 1, 1, 30, 20));
-  const auto capacity = std::numeric_limits<std::size_t>::max();
-  EXPECT_FALSE(reference_index(maximum, 1, 1, capacity, capacity));
-  EXPECT_EQ(reference_index(2, 1, 1, capacity, capacity - 1), 1u);
+  EXPECT_FALSE(reference_elapsed(99, 100));
+  EXPECT_FALSE(reference_elapsed(100, 0));
+  EXPECT_FALSE(reference_elapsed(100, -1));
+  EXPECT_FALSE(reference_elapsed(std::numeric_limits<std::int64_t>::min(), 1));
+  ASSERT_TRUE(reference_elapsed(100, 100));
+  EXPECT_DOUBLE_EQ(*reference_elapsed(100, 100), 0.0);
+  const auto maximum = std::numeric_limits<std::int64_t>::max();
+  ASSERT_TRUE(reference_elapsed(maximum, maximum - 100));
+  EXPECT_NEAR(*reference_elapsed(maximum, maximum - 100), 1e-7, 1e-22);
+  EXPECT_TRUE(std::isfinite(*reference_elapsed(maximum, 1)));
 }

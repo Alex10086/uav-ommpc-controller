@@ -13,7 +13,7 @@
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
-#include <uav_ommpc_interfaces/msg/reference_trajectory.hpp>
+#include <uav_ommpc_interfaces/msg/polynomial_trajectory.hpp>
 #include <uav_ommpc_interfaces/msg/thrust_rates.hpp>
 #include <uav_ommpc_controller/ommpc.hpp>
 
@@ -25,7 +25,7 @@ namespace dynamics = uav_ommpc_controller::dynamics;
 namespace mpc = uav_ommpc_controller::ommpc;
 using px4_msgs::msg::VehicleOdometry;
 using px4_msgs::msg::VehicleStatus;
-using uav_ommpc_interfaces::msg::ReferenceTrajectory;
+using uav_ommpc_interfaces::msg::PolynomialTrajectory;
 using uav_ommpc_interfaces::msg::ThrustRates;
 using Clock = std::chrono::steady_clock;
 
@@ -50,8 +50,8 @@ public:
       [this](const VehicleOdometry &message) {receive_odometry(message);});
     status_sub_ = create_subscription<VehicleStatus>("/uav/status", telemetry,
       [this](const VehicleStatus &message) {receive_status(message);});
-    reference_sub_ = create_subscription<ReferenceTrajectory>("/uav/reference_trajectory", reliable,
-      [this](ReferenceTrajectory::ConstSharedPtr message) {receive_reference(std::move(message));});
+    reference_sub_ = create_subscription<PolynomialTrajectory>("/uav/reference_polynomial", reliable,
+      [this](PolynomialTrajectory::ConstSharedPtr message) {receive_reference(*message);});
     timer_ = create_wall_timer(period_, [this]() {control_step();});
     RCLCPP_INFO(get_logger(),
       "OMMPC ready: N=%d, dt=%.6f s; waiting for odometry/status/reference; no automatic arm or mode change",
@@ -104,6 +104,9 @@ private:
     vector_parameter("input_max", s.input_max);
     s.absolute_tolerance = parameter("absolute_tolerance", s.absolute_tolerance);
     s.relative_tolerance = parameter("relative_tolerance", s.relative_tolerance);
+    s.max_position_defect = parameter("max_position_defect", s.max_position_defect);
+    s.max_velocity_defect = parameter("max_velocity_defect", s.max_velocity_defect);
+    s.max_attitude_defect = parameter("max_attitude_defect", s.max_attitude_defect);
     return s;  // Controller validates the remaining numerical settings.
   }
 
@@ -130,6 +133,8 @@ private:
       return;
     }
     odometry_at_ = Clock::now();
+    // Pair the measured state with ROS receipt time, never PX4 boot time.
+    odometry_ros_ns_ = get_clock()->now().nanoseconds();
   }
 
   void receive_status(const VehicleStatus &message)
@@ -148,23 +153,19 @@ private:
     // Do not require Offboard/armed: the bridge needs fresh inputs to prime its heartbeat.
   }
 
-  void receive_reference(ReferenceTrajectory::ConstSharedPtr message)
+  void receive_reference(const PolynomialTrajectory &message)
   {
     trajectory_.reset();  // A malformed replacement must not silently keep an old plan active.
-    if (message->header.frame_id != "ned" || message->header.stamp.sec < 0 ||
-      message->header.stamp.nanosec >= 1000000000u ||
-      !std::isfinite(message->dt) || std::abs(message->dt - settings_.dt) > 1e-9 ||
-      message->inputs.size() < static_cast<std::size_t>(settings_.horizon) ||
-      message->inputs.size() > 2000 || message->states.size() != message->inputs.size() + 1)
+    try
     {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Rejected reference frame, timestamp, dt or dimensions");
-      return;
+      trajectory_ = uav_ommpc_ros::decode_polynomial(message, reference_start_ns_, settings_.gravity);
+      reference_at_ = Clock::now();
     }
-    reference_start_ns_ = static_cast<std::int64_t>(message->header.stamp.sec) * 1000000000LL +
-      message->header.stamp.nanosec;
-    if (reference_start_ns_ <= 0) return;
-    trajectory_ = std::move(message);
-    reference_at_ = Clock::now();
+    catch (const std::invalid_argument &error)
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Rejected polynomial reference: %s", error.what());
+    }
   }
 
   static bool fresh(const std::optional<Clock::time_point> &at, double timeout, Clock::time_point now)
@@ -172,7 +173,7 @@ private:
     return at && now - *at <= std::chrono::duration<double>(timeout);
   }
 
-  std::optional<std::size_t> active_window(Clock::time_point steady_now, std::int64_t ros_now_ns)
+  std::optional<double> active_reference(Clock::time_point steady_now, std::int64_t ros_now_ns)
   {
     if (ros_now_ns < last_ros_ns_)
     {
@@ -183,34 +184,32 @@ private:
     if (!fresh(odometry_at_, odometry_timeout_, steady_now) ||
       !fresh(status_at_, status_timeout_, steady_now) || !status_healthy_ || !trajectory_ ||
       !fresh(reference_at_, reference_timeout_, steady_now)) return std::nullopt;
-    return uav_ommpc_ros::reference_index(ros_now_ns, reference_start_ns_, period_.count(),
-      trajectory_->inputs.size(), static_cast<std::size_t>(settings_.horizon));
+    const auto now_elapsed = uav_ommpc_ros::reference_elapsed(ros_now_ns, reference_start_ns_);
+    const auto anchor_elapsed = uav_ommpc_ros::reference_elapsed(odometry_ros_ns_, reference_start_ns_);
+    if (!now_elapsed || !anchor_elapsed || odometry_ros_ns_ > ros_now_ns) return std::nullopt;
+    dynamics::State state;
+    dynamics::ControlInput input;
+    // Validate both current geometry and the measured state's prediction anchor.
+    if (!trajectory_->sample(*now_elapsed, state, input) ||
+      !trajectory_->sample(*anchor_elapsed, state, input)) return std::nullopt;
+    return anchor_elapsed;
   }
 
   void control_step()
   {
     const auto started = Clock::now();
-    const auto index = active_window(started, get_clock()->now().nanoseconds());
-    if (!index)
+    const auto elapsed = active_reference(started, get_clock()->now().nanoseconds());
+    if (!elapsed)
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "Control paused: need fresh valid odometry/status and a current full reference horizon");
       return;
     }
-    for (int k = 0; k <= settings_.horizon; ++k)
+    if (!trajectory_->sample_horizon(*elapsed, settings_.dt, reference_states_, reference_inputs_))
     {
-      if (!uav_ommpc_ros::decode_reference(trajectory_->states[*index + k], reference_states_[k]))
-      {
-        trajectory_.reset();
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Rejected reference state/quaternion");
-        return;
-      }
-      if (k < settings_.horizon)
-      {
-        const auto &input = trajectory_->inputs[*index + k];
-        reference_inputs_[k] = {input.thrust_acceleration,
-          Eigen::Vector3d(input.body_rates[0], input.body_rates[1], input.body_rates[2])};
-      }
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Control paused: polynomial cannot supply a valid full reference horizon");
+      return;
     }
     const auto result = controller_->solve(actual_, reference_states_, reference_inputs_);
     if (result.status != mpc::Status::Solved || !result.command)
@@ -221,10 +220,10 @@ private:
       return;
     }
     const auto finished = Clock::now();
-    // Crossing a sample boundary is normal for asynchronous planner/control
-    // timers. Bound solve latency, not its phase relative to the reference grid.
+    // Ordinary reference sample boundary crossings are allowed. Bound solve
+    // latency and recheck the lease/telemetry/domain, not a floor-grid index.
     if (finished - started > period_ ||
-      !active_window(finished, get_clock()->now().nanoseconds()))
+      !active_reference(finished, get_clock()->now().nanoseconds()))
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Discarded late or expired OMMPC solution");
       return;
@@ -245,13 +244,13 @@ private:
   std::uint64_t last_sample_{}, last_status_{};
   std::optional<std::uint8_t> reset_counter_;
   bool status_healthy_{false};
-  ReferenceTrajectory::ConstSharedPtr trajectory_;
-  std::int64_t reference_start_ns_{}, last_ros_ns_{};
+  std::unique_ptr<const uav_ommpc_controller::reference::PolynomialReference> trajectory_;
+  std::int64_t reference_start_ns_{}, last_ros_ns_{}, odometry_ros_ns_{};
   ThrustRates output_;
   rclcpp::Publisher<ThrustRates>::SharedPtr output_pub_;
   rclcpp::Subscription<VehicleOdometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<VehicleStatus>::SharedPtr status_sub_;
-  rclcpp::Subscription<ReferenceTrajectory>::SharedPtr reference_sub_;
+  rclcpp::Subscription<PolynomialTrajectory>::SharedPtr reference_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 }  // namespace

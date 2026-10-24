@@ -13,6 +13,10 @@ struct Settings
   int horizon = 20;
   double dt = 0.02;
   double gravity = dynamics::kGravity;
+  // Per-step reference defects: safety/chart limits, not flight guarantees.
+  double max_position_defect = 0.05;  // m
+  double max_velocity_defect = 0.25;  // m/s
+  double max_attitude_defect = 0.1;   // rad, strictly below pi - 1e-3
   linearization::StateError state_weights =
     (linearization::StateError() << 1000.0, 1000.0, 800.0, 20.0, 20.0, 20.0, 40.0, 40.0, 40.0).finished();
   linearization::StateError terminal_weights = 2.0 * state_weights;
@@ -24,19 +28,20 @@ struct Settings
   double relative_tolerance = 1e-5;
 };
 
-// Paper notation: delta_X = M * delta_U + H * delta_x0, stacking x1..xN.
+// Paper notation: delta_X = M * delta_U + H * delta_x0 + D, stacking x1..xN.
 // Solver objective: 0.5 * delta_U^T * P * delta_U + q^T * delta_U.
 struct CondensedQp
 {
   Eigen::MatrixXd M;
   Eigen::MatrixXd H;
   Eigen::MatrixXd P;
+  Eigen::VectorXd D;
   Eigen::VectorXd q;
   Eigen::VectorXd lower;
   Eigen::VectorXd upper;
 };
 
-enum class Status { Solved, InvalidInput, ReferenceMismatch, SolverFailure };
+enum class Status { Solved, InvalidInput, ReferenceOutOfDomain, SolverFailure };
 
 struct Result
 {
@@ -48,8 +53,8 @@ struct Result
 };
 
 // One instance per control loop; not thread-safe. Allocates workspace at construction.
-// References: N+1 states and N inputs, sampled at dt, dynamically consistent to 1e-6
-// per position/velocity/attitude norm, with inputs inside the configured box.
+// References: N+1 states and N inputs, sampled at dt, with per-step defects
+// inside the configured domain limits and inputs inside the configured box.
 // NED/FRD, thrust acceleration in m/s^2, body rates in rad/s; no ROS or motor model.
 class Controller
 {

@@ -66,7 +66,8 @@ Eigen::VectorXd recursive_prediction(const mpc::Settings &settings, const Refere
   Eigen::VectorXd states(9 * settings.horizon);
   for (int k = 0; k < settings.horizon; ++k)
   {
-    error = lin::linearize(reference.states[k], reference.inputs[k], settings.dt)
+    error = lin::linearize(reference.states[k], reference.inputs[k], reference.states[k + 1],
+      settings.dt, settings.gravity)
       .predict(error, inputs.segment<4>(4 * k));
     states.segment<9>(9 * k) = error;
   }
@@ -107,7 +108,14 @@ TEST(Ommpc, TimeVaryingCondensationAndObjectiveMatchRecursiveModels)
   settings.state_weights << 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0;
   settings.terminal_weights << 31.0, 29.0, 23.0, 19.0, 17.0, 13.0, 11.0, 7.0, 5.0;
   settings.input_weights << 0.7, 1.3, 1.9, 2.3;
-  const auto reference = make_reference(settings, true);
+  auto reference = make_reference(settings, true);
+  for (int k = 1; k <= settings.horizon; ++k)
+  {
+    reference.states[k].p += k * Vector3d(0.003, -0.002, 0.001);
+    reference.states[k].v += k * Vector3d(-0.004, 0.002, 0.003);
+    reference.states[k].R *= Eigen::AngleAxisd(0.01 * k,
+      Vector3d(-1.0, 3.0, 2.0).normalized()).toRotationMatrix();
+  }
   StateError initial;
   initial << 0.03, -0.02, 0.01, -0.04, 0.02, 0.03, 0.01, -0.02, 0.015;
   mpc::Controller controller(settings);
@@ -123,17 +131,29 @@ TEST(Ommpc, TimeVaryingCondensationAndObjectiveMatchRecursiveModels)
   ASSERT_EQ(qp.P.cols(), dimension);
   ASSERT_EQ(qp.q.size(), dimension);
   const Eigen::VectorXd zero = Eigen::VectorXd::Zero(dimension);
+  ASSERT_EQ(qp.D.size(), 9 * settings.horizon);
+  EXPECT_GT(qp.D.norm(), 0.01);
+  EXPECT_LT((qp.D - recursive_prediction(
+    settings, reference, StateError::Zero(), zero)).norm(), 1e-12);
+  StateError accumulated = StateError::Zero();
+  for (int k = 0; k < settings.horizon; ++k)
+  {
+    const auto model = lin::linearize(reference.states[k], reference.inputs[k],
+      reference.states[k + 1], settings.dt, settings.gravity);
+    accumulated = model.A * accumulated + model.d;
+    EXPECT_LT((qp.D.segment<9>(9 * k) - accumulated).norm(), 1e-12);
+  }
   for (int column = 0; column < 9; ++column)
   {
     const StateError basis = StateError::Unit(column);
-    EXPECT_LT((qp.H.col(column) - recursive_prediction(settings, reference, basis, zero)).norm(),
+    EXPECT_LT((qp.H.col(column) + qp.D - recursive_prediction(settings, reference, basis, zero)).norm(),
       1e-12);
   }
   const double baseline = recursive_cost(settings, reference, initial, zero);
   for (int column = 0; column < dimension; ++column)
   {
     const Eigen::VectorXd basis = Eigen::VectorXd::Unit(dimension, column);
-    EXPECT_LT((qp.M.col(column) - recursive_prediction(
+    EXPECT_LT((qp.M.col(column) + qp.D - recursive_prediction(
       settings, reference, StateError::Zero(), basis)).norm(), 1e-12);
     const double plus = recursive_cost(settings, reference, initial, basis);
     const double minus = recursive_cost(settings, reference, initial, -basis);
@@ -193,6 +213,8 @@ TEST(Ommpc, ZeroHoverErrorReturnsExactFeedforward)
   EXPECT_LT((pack(*result.command) - pack(reference.inputs.front())).norm(), 1e-10);
   EXPECT_LT(controller.input_errors().norm(), 1e-10);
   EXPECT_LT(controller.predicted_errors().norm(), 1e-10);
+  EXPECT_EQ(controller.problem().D.norm(), 0.0);
+  EXPECT_EQ(controller.problem().q.norm(), 0.0);
   EXPECT_LE(result.max_constraint_violation, 1e-4);
 }
 
@@ -279,7 +301,8 @@ TEST(Ommpc, SingleStepUsesOnlyTerminalStateWeight)
   mpc::Controller controller(settings);
   ASSERT_EQ(controller.solve(lin::apply_state_error(reference.states.front(), initial),
     reference.states, reference.inputs).status, mpc::Status::Solved);
-  const auto model = lin::linearize(reference.states.front(), reference.inputs.front(), settings.dt);
+  const auto model = lin::linearize(reference.states.front(), reference.inputs.front(),
+    reference.states[1], settings.dt, settings.gravity);
   Eigen::Matrix4d expected = model.B.transpose() * settings.terminal_weights.asDiagonal() * model.B;
   expected.diagonal() += settings.input_weights;
   expected *= 2.0;
@@ -292,7 +315,66 @@ TEST(Ommpc, SingleStepUsesOnlyTerminalStateWeight)
   EXPECT_LT((controller.input_errors() - expected.ldlt().solve(-expected_q)).norm(), 1e-4);
 }
 
-TEST(Ommpc, ReferenceMismatchClearsPreviousCommandAndSolutionForEveryStateComponent)
+TEST(Ommpc, AffineWorkspaceClearsDefectsWhenReusedForConsistentMovingReference)
+{
+  mpc::Settings settings;
+  settings.horizon = 4;
+  settings.gravity = 3.7;
+  const auto consistent = make_reference(settings, true);
+  auto affine = consistent;
+  affine.states.back().p.x() += 0.5 * settings.max_position_defect;
+  affine.states.back().v.y() += 0.5 * settings.max_velocity_defect;
+  affine.states.back().R *= Eigen::AngleAxisd(
+    0.5 * settings.max_attitude_defect, Vector3d::UnitX()).toRotationMatrix();
+  mpc::Controller controller(settings);
+  ASSERT_EQ(controller.solve(affine.states.front(), affine.states, affine.inputs).status,
+    mpc::Status::Solved);
+  EXPECT_GT(controller.problem().D.norm(), 0.01);
+  EXPECT_GT(controller.problem().q.norm(), 0.01);
+  StateError initial = StateError::Constant(0.001);
+  ASSERT_EQ(controller.solve(lin::apply_state_error(consistent.states.front(), initial),
+    consistent.states, consistent.inputs).status, mpc::Status::Solved);
+  const auto &qp = controller.problem();
+  EXPECT_LT(qp.D.norm(), 1e-14);
+  EXPECT_LT((controller.predicted_errors() -
+    (qp.H * initial + qp.M * controller.input_errors())).norm(), 1e-12);
+  Eigen::VectorXd weights(9 * settings.horizon);
+  for (int k = 0; k < settings.horizon; ++k)
+  {
+    weights.segment<9>(9 * k) = k + 1 == settings.horizon ?
+      settings.terminal_weights : settings.state_weights;
+  }
+  const Eigen::VectorXd expected_q = 2.0 * qp.M.transpose() *
+    weights.asDiagonal() * qp.H * initial;
+  EXPECT_LT((qp.q - expected_q).norm(), 1e-10);
+}
+
+TEST(Ommpc, ConfiguredDefectBoundsAcceptSmallDefectsAndRejectExcess)
+{
+  mpc::Settings settings;
+  settings.horizon = 1;
+  settings.max_position_defect = 0.002;
+  settings.max_velocity_defect = 0.003;
+  settings.max_attitude_defect = 0.004;
+  const auto reference = make_reference(settings);
+  mpc::Controller controller(settings);
+  for (int component = 0; component < 3; ++component)
+  {
+    for (double factor : {0.5, 2.0})
+    {
+      auto states = reference.states;
+      if (component == 0) states[1].p.x() += factor * settings.max_position_defect;
+      if (component == 1) states[1].v.y() += factor * settings.max_velocity_defect;
+      if (component == 2) states[1].R *= Eigen::AngleAxisd(
+        factor * settings.max_attitude_defect, Vector3d::UnitZ()).toRotationMatrix();
+      const auto result = controller.solve(states.front(), states, reference.inputs);
+      EXPECT_EQ(result.status, factor < 1.0 ?
+        mpc::Status::Solved : mpc::Status::ReferenceOutOfDomain);
+    }
+  }
+}
+
+TEST(Ommpc, ReferenceOutOfDomainClearsPreviousCommandAndSolutionForEveryStateComponent)
 {
   mpc::Settings settings;
   settings.horizon = 4;
@@ -304,12 +386,13 @@ TEST(Ommpc, ReferenceMismatchClearsPreviousCommandAndSolutionForEveryStateCompon
     ASSERT_EQ(controller.solve(reference.states.front(), reference.states, reference.inputs).status,
       mpc::Status::Solved);
     auto inconsistent = reference.states;
-    if (component == 0) inconsistent[2].p.x() += 1e-4;
-    if (component == 1) inconsistent[2].v.y() += 1e-4;
+    if (component == 0) inconsistent[2].p.x() += 2.0 * settings.max_position_defect;
+    if (component == 1) inconsistent[2].v.y() += 2.0 * settings.max_velocity_defect;
     if (component == 2)
-      inconsistent[2].R *= Eigen::AngleAxisd(1e-4, Vector3d::UnitZ()).toRotationMatrix();
+      inconsistent[2].R *= Eigen::AngleAxisd(
+        2.0 * settings.max_attitude_defect, Vector3d::UnitZ()).toRotationMatrix();
     expect_failure(controller, controller.solve(reference.states.front(), inconsistent,
-      reference.inputs), mpc::Status::ReferenceMismatch, settings.horizon);
+      reference.inputs), mpc::Status::ReferenceOutOfDomain, settings.horizon);
   }
 }
 
@@ -383,6 +466,16 @@ TEST(Ommpc, InvalidSettingsThrowBeforeCreatingAController)
     [](auto &s) { s.gravity = 0.0; },
     [nan](auto &s) { s.gravity = nan; },
     [inf](auto &s) { s.gravity = inf; },
+    [](auto &s) { s.max_position_defect = 0.0; },
+    [](auto &s) { s.max_velocity_defect = -0.1; },
+    [](auto &s) { s.max_attitude_defect = 0.0; },
+    [](auto &s) { s.max_attitude_defect = 3.14159265358979323846 - 1e-3; },
+    [nan](auto &s) { s.max_position_defect = nan; },
+    [inf](auto &s) { s.max_position_defect = inf; },
+    [nan](auto &s) { s.max_velocity_defect = nan; },
+    [inf](auto &s) { s.max_velocity_defect = inf; },
+    [nan](auto &s) { s.max_attitude_defect = nan; },
+    [inf](auto &s) { s.max_attitude_defect = inf; },
     [](auto &s) { s.state_weights[0] = -1.0; },
     [nan](auto &s) { s.state_weights[4] = nan; },
     [](auto &s) { s.terminal_weights[8] = -1.0; },

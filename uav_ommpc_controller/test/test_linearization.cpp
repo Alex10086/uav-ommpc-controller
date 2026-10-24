@@ -54,7 +54,7 @@ TEST(Linearization, ZeroTimePreservesErrorsRegardlessOfInputPerturbation)
   StateError dx;
   dx << 0.1, -0.2, 0.3, -0.4, 0.5, 0.6, 0.02, -0.03, 0.04;
   const InputError du(0.5, -0.1, 0.2, 0.3);
-  const StateError predicted = lin::linearize(reference, input, 0.0).predict(dx, du);
+  const StateError predicted = lin::linearize(reference, input, reference, 0.0).predict(dx, du);
   EXPECT_EQ((predicted - dx).norm(), 0.0);
   const State next = dynamics::predict_step(
     lin::apply_state_error(reference, dx), perturb_input(input, du), 0.0);
@@ -68,7 +68,7 @@ TEST(Linearization, HoverPredictionHasNedThrustAndTiltSigns)
   StateError dx;
   dx << 1.0, 2.0, 3.0, 0.4, -0.2, 0.1, 0.01, -0.02, 0.03;
   const InputError du(0.4, 0.2, -0.3, 0.1);
-  const StateError predicted = lin::linearize(reference, input, 0.1).predict(dx, du);
+  const StateError predicted = lin::linearize(reference, input, reference, 0.1).predict(dx, du);
   StateError expected;
   // Positive roll drives +East; positive pitch drives -North; more thrust drives -Down.
   expected << 1.04, 1.98, 3.01,
@@ -84,7 +84,8 @@ TEST(Linearization, RotatingReferenceTransportsErrorIntoNextTangentFrame)
   const ControlInput input{0.0, Vector3d(0.0, 0.0, kPi / 2.0)};
   StateError dx = StateError::Zero();
   dx[6] = 0.01;
-  const StateError predicted = lin::linearize(reference, input, 1.0).predict(dx, InputError::Zero());
+  const StateError predicted = lin::linearize(
+    reference, input, dynamics::predict_step(reference, input, 1.0), 1.0).predict(dx, InputError::Zero());
   StateError expected = StateError::Zero();
   expected[7] = -0.01;
   EXPECT_LT((predicted - expected).norm(), 1e-15);
@@ -107,8 +108,16 @@ TEST(Linearization, AllJacobianColumnsMatchNonlinearCentralDifferences)
       Eigen::AngleAxisd(sample == 5 ? kPi - 1e-8 : 0.6,
         Vector3d(-2.0, 1.0, 3.0).normalized()).toRotationMatrix()};
     const ControlInput input{8.0 + sample, (angles[sample] / dt) * rate_axis};
-    const auto model = lin::linearize(reference, input, dt);
-    const State reference_next = dynamics::predict_step(reference, input, dt, gravity);
+    State reference_next = dynamics::predict_step(reference, input, dt, gravity);
+    // Nonzero defect in every chart, including a noncommuting rotation.
+    reference_next.p += Vector3d(0.01, -0.02, 0.005);
+    reference_next.v += Vector3d(-0.03, 0.02, 0.01);
+    reference_next.R *= Eigen::AngleAxisd(0.07,
+      Vector3d(-1.0, 3.0, 2.0).normalized()).toRotationMatrix();
+    const auto model = lin::linearize(reference, input, reference_next, dt, gravity);
+    EXPECT_LT((model.d - measure_error(
+      dynamics::predict_step(reference, input, dt, gravity), reference_next)).norm(), 1e-15);
+    EXPECT_LT((model.predict(StateError::Zero(), InputError::Zero()) - model.d).norm(), 1e-15);
     Eigen::Matrix<double, 9, 9> numeric_a;
     for (int column = 0; column < 9; ++column)
     {
@@ -165,7 +174,8 @@ TEST(Linearization, ZeroThrustRemovesAttitudeCouplingFromVelocity)
   const ControlInput input{0.0, Vector3d(0.2, -0.5, 0.7)};
   StateError dx = StateError::Zero();
   dx.tail<3>() << 0.3, -0.2, 0.1;
-  const auto model = lin::linearize(reference, input, 0.1);
+  const auto model = lin::linearize(
+    reference, input, dynamics::predict_step(reference, input, 0.1), 0.1);
   const StateError predicted = model.predict(dx, InputError::Zero());
   const State next = dynamics::predict_step(lin::apply_state_error(reference, dx), input, 0.1);
   const State reference_next = dynamics::predict_step(reference, input, 0.1);
@@ -184,8 +194,12 @@ TEST(Linearization, JointStateAndInputResidualIsSecondOrder)
     Eigen::AngleAxisd(0.8, Vector3d(1.0, -2.0, 3.0).normalized()).toRotationMatrix()};
   const ControlInput input{11.0, Vector3d(0.8, -0.5, 0.6)};
   constexpr double dt = 0.08;
-  const auto model = lin::linearize(reference, input, dt);
-  const State reference_next = dynamics::predict_step(reference, input, dt);
+  State reference_next = dynamics::predict_step(reference, input, dt);
+  reference_next.p += Vector3d(0.01, -0.02, 0.005);
+  reference_next.v += Vector3d(-0.03, 0.02, 0.01);
+  reference_next.R *= Eigen::AngleAxisd(0.08,
+    Vector3d(-1.0, 3.0, 2.0).normalized()).toRotationMatrix();
+  const auto model = lin::linearize(reference, input, reference_next, dt);
   StateError direction;
   direction << 0.3, -0.2, 0.1, 0.4, 0.2, -0.3, 0.6, -0.4, 0.3;
   const InputError input_direction(1.1, -0.5, 0.7, 0.2);
@@ -230,7 +244,8 @@ TEST(Linearization, ChainedModelsTrackMovingReferenceWithSecondOrderResidual)
       const ControlInput input{10.0 + 0.5 * std::sin(phase),
         Vector3d(0.5 * std::cos(phase), 0.2 * std::sin(phase), -0.3)};
       const InputError du = scale * InputError(0.7, 0.2, -0.4, 0.3);
-      predicted = lin::linearize(reference, input, 0.02).predict(predicted, du);
+      predicted = lin::linearize(reference, input,
+        dynamics::predict_step(reference, input, 0.02), 0.02).predict(predicted, du);
       actual = dynamics::predict_step(actual, perturb_input(input, du), 0.02);
       reference = dynamics::predict_step(reference, input, 0.02);
     }

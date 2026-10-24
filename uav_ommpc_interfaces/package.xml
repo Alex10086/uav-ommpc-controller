@@ -2,7 +2,7 @@
 <package format="3">
   <name>uav_ommpc_interfaces</name>
   <version>0.1.0</version>
-  <description>Thrust/rate commands and timed full-state references for OMMPC.</description>
+  <description>Thrust/rate commands and timed normalized polynomial trajectories for OMMPC.</description>
   <maintainer email="maintainer@uav-ommpc-controller.invalid">xerolab</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>

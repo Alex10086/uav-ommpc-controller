@@ -27,6 +27,7 @@ Namespaces below are relative to `uav_ommpc_controller`:
 | `so3::boxminus(R, R_ref)` | `Log(R_ref.transpose() * R)`, actual relative to reference |
 | `so3::left_jacobian(phi)` | `J_l = I + (1-cos(theta))/theta² * S + (theta-sin(theta))/theta³ * S²` |
 | `so3::right_jacobian(phi)` | `J_r(phi) = J_l(-phi) = J_l(phi).transpose()` |
+| `so3::right_jacobian_inverse(phi)` | Derivative of `Log(Exp(phi)*Exp(delta))` at zero delta, with stable small-angle coefficients |
 
 The Jacobians distinguish additive rotation-vector changes from local rotational increments:
 
@@ -90,7 +91,7 @@ The exported target now links the compiled `libuav_ommpc_controller.so`; mathema
 
 `cmake/FetchOsqp.cmake` pins OSQP 0.6.3 commit `0dd00a578cf1c2691c5c379965d504c75bf6cfad` and its QDLDL submodule (`7d16b70a10a152682204d745d814b6eb63dc5cd2`). For offline builds or reuse between standalone/colcon builds, pass `-DFETCHCONTENT_SOURCE_DIR_OSQP=/absolute/path/to/that/osqp/source` with its submodule populated. The current Jetson colcon build reuses `~/uav_control_ws/so3-math-build/_deps/osqp-src`. OSQP/QDLDL emit upstream CMake minimum-version deprecation warnings; these do not prevent the observed builds and are not suppressed.
 
-On Jetson, all 13 SO(3)/R³ tests passed in both standalone Release and colcon builds. Coverage includes hat/vee and cross products, Euclidean errors, right-handed quarter turns, zero/tiny rotations, the Taylor-branch boundary, pi and both sides of its branch cut, 500 seeded rotation round trips, right-local error direction, finite-difference Jacobians, vector-action derivatives, and 10,000 consecutive body-rate updates.
+SO(3)/R³ coverage includes hat/vee and cross products, Euclidean errors, right-handed quarter turns, zero/tiny rotations, the Taylor-branch boundary, pi and both sides of its branch cut, 500 seeded rotation round trips, right-local error direction, finite-difference Jacobians, the inverse right Jacobian, vector-action derivatives, and 10,000 consecutive body-rate updates. These tests are included in the current colcon verification below.
 
 An independent Release-mode CMake consumer also built against the installed package without sourcing ROS. With Eigen heap allocation disabled and assertions enabled, it recovered `[0.001, -0.002, 0.003]` rad with error `2.76e-17`; 1,000 body-rate updates differed from the closed-form rotation by `6.72e-14` in matrix Frobenius norm. The temporary consumer was removed after verification.
 
@@ -161,81 +162,79 @@ ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Dynamics\.' --output-on-fa
 
 An independent program compiled directly against the installed header without sourcing ROS, with Eigen heap allocation disabled and assertions enabled. Across 1,000 steps of 2 ms, yawing hover had zero position/velocity drift and a rotation-matrix error of `1.48e-14`. A tilted, constant-thrust trajectory matched its discrete closed-form solution with position error `6.31e-14 m` and velocity error `1.21e-13 m/s`. This verifies the mathematical predictor, not physical flight or PX4 integration. The temporary program was removed after verification.
 
-## Discrete local-error linearization
+## Affine local-error linearization
 
-Header: `uav_ommpc_controller/include/uav_ommpc_controller/linearization.hpp`.
-Namespace: `uav_ommpc_controller::linearization`. The implementation is header-only, uses fixed-size double-precision Eigen matrices, and reuses `dynamic.hpp` and `so3_math.hpp`.
+`include/uav_ommpc_controller/linearization.hpp` keeps the actual-minus-reference error
+`delta_x = [p-p_ref, v-v_ref, Log(R_ref.transpose()*R)]` and input error
+`delta_u = [a_T-a_T_ref, omega-omega_ref]`. Rotation errors are local rotation vectors, not Euler angles.
 
-### Error coordinates and API
-
-The 9-dimensional `StateError` is ordered as
-`[delta_p_world(3), delta_v_world(3), delta_theta_local(3)]`, where
-`delta_theta_local = Log(R_ref.transpose() * R)`. The 4-dimensional `InputError` is
-`[delta_thrust_acceleration, delta_omega_body(3)]`. Both errors are **actual minus reference**. Rotation errors are in radians, not Euler-angle differences or nine flattened rotation-matrix entries. Position/velocity errors are in metres and m/s.
-
-| API | Purpose |
-| --- | --- |
-| `state_error(actual, reference)` | Extract the compound R³ × R³ × SO(3) local state error |
-| `apply_state_error(reference, error)` | Reconstruct a state with `p_ref + dp`, `v_ref + dv`, `R_ref * Exp(dtheta)` |
-| `linearize(reference, reference_input, dt)` | Return `LinearModel` containing `A` (9×9) and `B` (9×4) |
-| `model.predict(delta_x, delta_u)` | Compute `delta_x_next = A * delta_x + B * delta_u` |
-
-The next error is measured about **the propagated reference**
-`reference_next = dynamics::predict_step(reference, reference_input, dt)`, not the old reference. Consequently, reconstruction must use `apply_state_error(reference_next, delta_x_next)`. The same gravity value must be used for reference and actual nonlinear propagation; its additive acceleration cancels from the Jacobians, so `linearize` needs no gravity argument.
-
-### Discrete Jacobians
-
-Let `R`, `a_T` and `omega` denote the reference attitude and input, `h = dt`,
-`e3 = [0, 0, 1]ᵀ` and `phi = h * omega`. The matrices are:
+`linearize(reference, input, next_reference, dt, gravity)` now accepts an independently sampled next reference. It returns fixed-size `A` (9×9), `B` (9×4), and `d` (9):
 
 ```text
-    [ I   h*I   0                  ]        [ 0          0          ]
-A = [ 0   I     h*a_T*R*hat(e3)     ],   B = [ -h*R*e3    0          ]
-    [ 0   0     Exp(-phi)          ]        [ 0          h*J_r(phi) ]
+nominal_next = dynamics::predict_step(reference, input, dt, gravity)
+d = state_error(nominal_next, next_reference)
+delta_x_next = d + A*delta_x + B*delta_u + O(norm([delta_x,delta_u])^2)
 ```
 
-All unshown blocks are zero. `J_r(phi) = J_l(phi).transpose()` uses the existing SO(3) right Jacobian. The orientation block `Exp(-phi)` transports the current right-local attitude error into the next reference's local coordinates. The signs in the velocity blocks follow `v_dot = g - a_T * R * e3`, consistent with the project's NED/FRD convention.
+Let `phi = dt*omega_ref` and `e3=[0,0,1]`. The original discrete derivatives are
+`A0 = [[I,dt*I,0], [0,I,dt*a_T*R*hat(e3)], [0,0,Exp(-phi)]]` and
+`B0 = [[0,0], [-dt*R*e3,0], [0,dt*J_r(phi)]]`.
+The new reference chart requires:
 
-These are analytic derivatives of the **implemented discrete** nonlinear step, not the approximation `A = I + h*A_continuous` for every block. In particular, the attitude blocks retain the exponential and right Jacobian at nonzero angular rates. Position has no same-step input/attitude coupling because `dynamic.hpp` uses `p_next = p + h*v`; gravity and the reference position/velocity do not affect the Jacobians.
+```text
+T = diag(I3, I3, J_r_inverse(d_rotation))
+A = T*A0
+B = T*B0
+```
 
-The approximation is
-`delta_x_next = A*delta_x + B*delta_u + O(||[delta_x, delta_u]||²)`
-locally about zero error. There is no affine reference defect: this API assumes the next reference is generated by the same nonlinear step. An arbitrary externally supplied next reference that violates that dynamics is not supported by simply changing the reconstruction reference; the error chart and linearization would need to be reconsidered. For a time-varying trajectory, recompute the model at each reference state/input and propagate errors between those successive reference charts.
+This follows `Log(Exp(d_rotation)*Exp(eta)) = d_rotation + J_r_inverse(d_rotation)*eta + O(norm(eta)^2)`. Merely adding `d` while retaining the old rotation blocks is not the correct first-order derivative for a nonzero attitude defect.
 
-### Usage
+`so3::right_jacobian_inverse(phi)` uses
+`I + 0.5*hat(phi) + c*hat(phi)^2`, with
+`c=(1-theta/2*cot(theta/2))/theta^2`; near zero it uses `1/12 + theta^2/720 + theta^4/30240`. The principal Log chart must stay away from pi.
 
 ```cpp
-#include <uav_ommpc_controller/linearization.hpp>
-
-namespace dyn = uav_ommpc_controller::dynamics;
 namespace lin = uav_ommpc_controller::linearization;
-const double dt = 0.01;
-
-// actual/reference are dyn::State; input/reference_input are dyn::ControlInput.
-const auto model = lin::linearize(reference, reference_input, dt);
-const lin::StateError dx = lin::state_error(actual, reference);
+const auto model = lin::linearize(reference, reference_input, next_reference, dt);
+const auto dx = lin::state_error(actual, reference);
 lin::InputError du;
 du << input.thrust_acceleration - reference_input.thrust_acceleration,
   input.body_rates - reference_input.body_rates;
-
-const lin::StateError dx_next = model.predict(dx, du);
-const auto reference_next = dyn::predict_step(reference, reference_input, dt);
-const dyn::State predicted_next = lin::apply_state_error(reference_next, dx_next);
+const auto predicted = lin::apply_state_error(next_reference, model.predict(dx, du));
 ```
 
-The same finite-input, valid-SO(3), nonnegative-time and physical-input preconditions as `dynamic.hpp` apply; no validation, clamping or matrix repair is performed. Error perturbations must be small, and the principal attitude chart must stay away from its pi branch cut. Nominal orientation need not be near identity: large absolute attitudes are valid. `apply_state_error` preserves the rotation-manifold structure but does not turn the first-order model into an exact nonlinear predictor.
+The obsolete three-argument linearization API is removed, not kept as an alias. Gravity must match the nonlinear model and reference sampler. Zero defect reduces to the original discrete model. `dynamic.hpp` is deliberately unchanged: retaining the residual does **not** make the forward-Euler model an exact continuous-time integrator.
 
-### Sources and verification
+## Continuous polynomial references
 
-The author [preprint](https://arxiv.org/html/2106.15233v1) defines actual-minus-reference errors in (17)–(18), the discrete error linearization in (20)–(23), manifold transport in Table I, and quadrotor derivatives in (34). Equation numbers here refer to the preprint, not verified journal-version numbering. The reference repository's [`setStateMatricesAndBounds`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/src/controller_core.cpp) supplies the same block structure and `J_l(phi).transpose()` rotation-input block; its body +Z thrust signs are not copied into this NED/FRD model.
+`include/uav_ommpc_controller/polynomial_reference.hpp` and `src/polynomial_reference.cpp` implement the ROS-independent `reference::PolynomialReference` sampler.
 
-All 8 linearization tests pass on Jetson in standalone Release and colcon builds. They check chart packing/reconstruction, zero time, hover tilt/thrust signs, transport to the next tangent frame, all columns of the 9×9 and 9×4 Jacobians against nonlinear central differences, zero-thrust boundary behavior, second-order joint-perturbation residuals, and 20 chained models along a moving reference. Central differences include zero/tiny rates, both sides of the SO(3) Taylor threshold, a step rotation near pi, a nominal attitude near pi, and different common gravity values; maximum-entry discrepancies are below `3e-9`.
+- A trajectory contains 1–100 segments. Each segment has a finite positive duration and separate `x`, `y`, `z`, `yaw` arrays, each containing 1–10 coefficients (degree 0–9).
+- Coefficients are **ascending powers of normalized segment time** `s=(t-segment_start)/duration`. Position is NED metres; yaw is unwrapped radians. Different axes may have different polynomial degrees.
+- Simultaneous Horner evaluation returns analytic position, velocity, acceleration and jerk. The r-th derivative is divided by `duration^r`; no finite differences are used to manufacture discrete consistency.
+- Internal knots require C3 position and C1 yaw continuity within absolute `1e-6` norms. The sampler selects the right-hand segment at knots. Wrapped yaw discontinuities must be unwrapped by the planner.
+- Negative/nonfinite time, invalid coefficients/durations, nonfinite derivatives and discontinuities are rejected. Invalid construction throws `std::invalid_argument`; invalid sample evaluation returns false.
 
-```bash
-ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Linearization\.' --output-on-failure
+Flatness mapping uses `force=g*e3-a`, `a_T=norm(force)`, `b3=force/a_T`,
+`ypsi=[-sin(yaw),cos(yaw),0]`, `b1=normalize(ypsi cross b3)`, `b2=b3 cross b1`.
+`R=[b1,b2,b3]`; analytic derivatives from jerk and yaw rate give
+`omega=vee(skew_part(R.transpose()*R_dot))`. This retains Euler heading in the **upright** domain. Force norms <=`1e-6`, `b3.z()<=1e-3`, degenerate heading axes or nonfinite results are rejected; no fake attitude or force clipping is substituted. Actuator limits are checked by the controller, not hidden inside the sampler.
+
+`hold_final=false` forbids extrapolation after the final segment. `hold_final=true` is accepted only when terminal velocity, acceleration, jerk and yaw rate are all stationary within `1e-6`; it then extends that terminal pose with hover. A moving endpoint cannot silently become a hover. Receipt freshness at the ROS layer still applies during a hold.
+
+```cpp
+namespace ref = uav_ommpc_controller::reference;
+ref::Segment hover{1.0, {0.0}, {0.0}, {-2.0}, {0.0}};
+ref::PolynomialReference trajectory({hover}, true);
+std::vector<uav_ommpc_controller::dynamics::State> states(21);
+std::vector<uav_ommpc_controller::dynamics::ControlInput> inputs(20);
+if (trajectory.sample_horizon(elapsed_seconds, 0.02, states, inputs)) {
+  const auto result = controller.solve(actual, states, inputs);
+}
 ```
 
-An independent program compiled against the installed header without sourcing ROS, with Eigen heap allocation disabled and assertions enabled. It reconstructed full predicted states and compared them with nonlinear steps at joint-perturbation scales `0.02`, `0.01`, `0.005`. Velocity residuals were `5.4873e-5`, `1.3715e-5`, `3.4285e-6` m/s, and attitude residuals were `2.3841e-6`, `5.9603e-7`, `1.4901e-7` rad: each halving reduced these residuals by approximately four. Position errors were below `6.3e-16 m`; reconstructed-rotation orthogonality errors were below `4.7e-16`. The temporary consumer was removed afterward. This is mathematical-model verification, not flight or MPC-solver validation.
+`sample_flat` exposes p/v/a/j/yaw/yaw-rate; `sample` returns one full state/input. Individual outputs remain unchanged on failure. `sample_horizon` requires pre-sized N+1/N buffers and does not allocate or resize; callers discard partially filled buffers on failure. Without terminal hold, the whole horizon must fit within the trajectory.
+
 
 ## Condensed on-manifold MPC
 
@@ -247,15 +246,16 @@ Namespace: `uav_ommpc_controller::ommpc`. `Controller` owns one persistent OSQP 
 `solve(actual, reference, feedforward)` takes one measured/predicted `dynamics::State`, **N+1 reference states** (`x_ref,0` through `x_ref,N`) and **N feedforward inputs** (`u_ref,0` through `u_ref,N-1`), all at `Settings::dt`.
 
 - Frames, units, right-local attitude error and actual-minus-reference signs match the earlier modules.
-- Each reference transition must satisfy `dynamic.hpp` with the configured gravity. Position, velocity and rotation-vector defect norms must each be at most `1e-6`. Reference inputs must lie inside the configured box.
-- The controller rejects mismatched dimensions, nonfinite data, invalid rotation matrices, out-of-box references and dynamically inconsistent reference transitions. It does not silently regenerate or repair the trajectory.
-- A position-only trajectory is not a complete reference: velocity, attitude, thrust acceleration and body rates are required. `examples/ommpc_tracking.cpp` demonstrates constructing them consistently using forward position/velocity differences, `R*e3 = (g-a)/||g-a||`, `a_T = ||g-a||`, and `omega = Log(R_k.transpose()*R_{k+1})/dt`.
+- Reference defects are retained in the affine model. Defaults allow position defect norm up to `0.05 m`, velocity defect norm up to `0.25 m/s`, and attitude defect norm up to `0.1 rad` per step, configured by `max_position_defect`, `max_velocity_defect`, `max_attitude_defect`.
+- Invalid dimensions/nonfinite states/rotations or out-of-box feedforward remain rejected. A defect exceeding its configured local-model domain returns `ReferenceOutOfDomain`; the obsolete `ReferenceMismatch` status is removed.
+- The limits are conservative initial domain guards, not proof of aircraft feasibility. They must remain finite/positive, and the attitude limit must be below pi minus `1e-3`. Do not increase them to hide wrong frames, timestamps or discontinuous references.
+- The pure solver still receives full state/input vectors, not polynomial coefficients. The sampler supplies them from analytic derivatives, so normal Euler discretization defects are expected rather than rejected at `1e-6`.
 
-As with `linearization.hpp`, this is a local one-linearization-per-cycle MPC. Small tracking errors and dynamically feasible references are assumed; no nonlinear SQP iterations or affine trajectory-defect model are added.
+This remains local, one-linearization-per-cycle MPC, without nonlinear SQP iterations. Affine defects do not remove model discretization error or make an actuator-infeasible path trackable; retime the trajectory instead of clipping its analytic derivatives.
 
 ### Condensation and QP
 
-From each reference state/input, obtain `A_k, B_k` using `linearization::linearize`. Stack
+From each reference state/input/next-state, obtain `A_k, B_k, d_k` using `linearization::linearize`. Stack
 `delta_X = [delta_x1; ...; delta_xN]` and `delta_U = [delta_u0; ...; delta_uN-1]`.
 The recursive coefficients are:
 
@@ -263,7 +263,8 @@ The recursive coefficients are:
 H_0 = A_0                         M_0,0 = B_0
 H_k = A_k * H_{k-1}               M_k,j = A_k * M_{k-1,j}   (j < k)
                                   M_k,k = B_k               (j > k: zero)
-delta_X = H * delta_x0 + M * delta_U
+s_0 = 0; s_{k+1} = A_k*s_k + d_k; D = [s_1; ...; s_N]
+delta_X = H * delta_x0 + M * delta_U + D
 ```
 
 The stage cost penalizes state errors `x1..xN-1`, terminal error `xN`, and input errors `u0..uN-1`. The cost of the fixed initial state `x0` is constant and omitted:
@@ -271,13 +272,13 @@ The stage cost penalizes state errors `x1..xN-1`, terminal error `xN`, and input
 ```text
 Qbar = diag(Q, ..., Q, Q_terminal)     Rbar = diag(R, ..., R)
 P = 2 * (M.transpose() * Qbar * M + Rbar)
-q = 2 * M.transpose() * Qbar * H * delta_x0
+q = 2 * M.transpose() * Qbar * (H * delta_x0 + D)
 
 minimize  0.5 * delta_U.transpose() * P * delta_U + q.transpose() * delta_U
 subject to  u_min - u_ref,k <= delta_u_k <= u_max - u_ref,k,  k = 0..N-1
 ```
 
-Only **4N decision variables** remain; state equalities are eliminated rather than passed to OSQP. Positive input weights keep the Hessian positive definite even if state weights are zero. `problem()` exposes `M`, `H`, `P`, `q`, `lower`, `upper` for inspection after a successful solve. `input_errors()` and `predicted_errors()` expose the optimized stacked errors, owned by the controller and overwritten by the next call.
+Only **4N decision variables** remain; state equalities are eliminated rather than passed to OSQP. Positive input weights keep the Hessian positive definite even if state weights are zero. `problem()` exposes `M`, `H`, `D`, `P`, `q`, `lower`, `upper`. The Hessian formula is unchanged, but its coefficients change when the transported A/B change. `input_errors()` and `predicted_errors()` expose the optimized stacked errors, owned by the controller and overwritten by the next call.
 
 OSQP 0.6.3 receives the fixed upper-triangular Hessian sparsity pattern and identity constraint matrix. Every cycle updates numerical coefficients, gradient and bounds without recreating the workspace. Warm starts shift the previous **absolute** input sequence, then subtract the new feedforward and project only the initial guess into the new box; stale input-error coordinates are not reused. Dual guesses start at zero. The returned solution is not clipped.
 
@@ -298,6 +299,7 @@ For Hessian construction, symmetric column inner products skip structurally zero
 | OSQP iteration limit | `400` |
 | OSQP absolute / relative tolerances | `1e-5 / 1e-5` |
 | Maximum accepted input-bound violation | `1e-4` in the corresponding input units |
+| Position / velocity / attitude defect domain | `0.05 m / 0.25 m/s / 0.1 rad` per step |
 
 State/input weights start from the reference repository's 20-step tuning, with a doubled terminal penalty and no horizon discount. The terminal vector is an independent settings field: modifying `state_weights` later does not automatically change `terminal_weights`; set both when retuning. Supported horizons are 1–100, and positive finite `dt`/gravity and positive finite input weights are required. Invalid settings throw `std::invalid_argument`; OSQP setup failure throws `std::runtime_error`.
 
@@ -333,32 +335,36 @@ if (result.command)
 
 ### Verification and reproducible tracking example
 
-All **39 tests** passed in standalone Release and colcon builds: the earlier 29 math/model tests plus 10 MPC tests. MPC coverage includes every condensed prediction column versus recursive time-varying propagation, Hessian/gradient/terminal indexing and factor-of-two conventions versus recursive cost, comparison to an unconstrained LDLT optimum, hover feedforward, active input bounds, changing-reference workspace reuse, invalid input/reference rejection and clearing stale solutions, and forced one-iteration solver failure.
+The polynomial cutover passed **73 colcon-reported tests** (zero errors/failures/skips), plus **8 Python publisher tests**. Coverage includes nonzero rotational-defect finite differences, second-order affine residual convergence, condensed D/gradient/objective comparisons, zero-defect regression, polynomial derivative scaling and continuity, flatness body-rate derivatives, stationary holds, malformed inputs and existing solver/bridge failure handling.
 
 ```bash
-ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Ommpc\.' --output-on-failure
+ctest --test-dir ~/uav_control_ws/build/uav_ommpc_controller --output-on-failure
 ~/uav_control_ws/install/uav_ommpc_controller/bin/ommpc_tracking
-# Or use ~/uav_control_ws/so3-math-build/ommpc_tracking.
+# Rebuilding the standalone CMake project provides the same executable there.
 # Disable building this example with -DBUILD_EXAMPLES=OFF.
 ```
 
-`ommpc_tracking` simulates a 12-second, 5 m radius circle at analytic speed 5 m/s and fixed 2 m altitude/yaw. It uses the **nonlinear** `dynamic.hpp` plant, exact discrete reference transitions, initial position error `[0.2, -0.15, 0.1] m`, and nonzero velocity/attitude errors. It stops on solver failure, invalid output or bound violation and returns failure if post-2-second position RMSE exceeds 0.15 m. Latency is measured over complete `Controller::solve` calls (including validation, linearization, condensation, QP updates and solve), not OSQP iterations alone. It reports 20 ms deadline misses but does not run as a paced real-time process.
+`ommpc_tracking` now creates degree-7 C3 Hermite polynomial pieces approximating a 5 m radius, 5 m/s circle, and evaluates their **analytic derivatives**. It runs two 12-second plants: unchanged Euler dynamics, and continuous zero-order-held dynamics integrated with RK4 at dt/20 (1 ms) and exact constant-body-rate attitude evolution. Both start with position error `[0.2,-0.15,0.1] m` plus velocity/attitude errors. The same 0.15 m post-2-second position-RMSE acceptance remains.
 
-Observed final installed Release executable on Jetson:
+The sampled references have genuine nonzero defects: maximum position/velocity defects were `0.000999989 m` / `0.000999989 m/s`, and attitude defect was `0.000105718 rad`. These would have failed the removed strict `1e-6` test.
 
-| Measurement | Result |
-| --- | ---: |
-| Completed solve calls / failures | 600 / 0 |
-| Position RMSE, entire run | 0.049724555 m |
-| Position RMSE, after 2 s | 0.000006082 m |
-| Maximum position error, entire run | 0.277367370 m |
-| Maximum position error, after 2 s | 0.000059362 m |
-| Peak model speed | 5.525948859 m/s |
-| Maximum input-bound violation | 0.000006914 |
-| Solve-call median / p95 / maximum | 0.820637 / 1.144456 / 2.331090 ms |
-| Solve calls above 20 ms | 0 |
+Observed installed Release executable on Jetson:
 
-The near-zero steady-state error is a **matched-model, disturbance-free simulation result**, not a claim of micrometre flight accuracy. No ROS/PX4/SITL or real aircraft was exercised by this example. An independent CMake consumer also linked the installed exported target without ROS and obtained correctly directed corrective thrust/rates.
+| Measurement | Euler plant | Continuous RK4 plant |
+| --- | ---: | ---: |
+| Completed solves / failures | 600 / 0 | 600 / 0 |
+| Position RMSE, entire run | 0.051798165 m | 0.050700618 m |
+| Position RMSE, after 2 s | 0.004218605 m | 0.014361560 m |
+| Velocity RMSE, after 2 s | 0.049483382 m/s | 0.014288840 m/s |
+| Maximum position error, after 2 s | 0.004230877 m | 0.014416599 m |
+| Maximum input-bound violation | 0.000000568 | 0.000003321 |
+| Solve-call median | 0.984768 ms | 0.985984 ms |
+| Solve-call p95 / maximum | 1.062403 / 1.731064 ms | 1.066243 / 1.559635 ms |
+| Calls above 20 ms | 0 | 0 |
+
+Timing covers `Controller::solve`, including affine linearization/condensation/OSQP, not ROS communication or polynomial sampling. A separate compile with Eigen allocation assertions enabled passed **combined horizon sampling and solving** for N=1,20,100 with nonzero D and no Eigen heap allocation during those calls. External solver allocation behavior and hard-real-time guarantees are not inferred from that check.
+
+These are model-only results. In particular, adding reference defects does not eliminate Euler integration bias: the position/velocity tradeoff and the continuous-plant error are now visible instead of being hidden by forward-difference references. No new PX4/Gazebo flight or hardware validation was performed for this cutover.
 
 The condensed formulation follows the author [preprint](https://arxiv.org/html/2106.15233v1), Section V-C, equations (25)–(30), using the existing actual-minus-reference error convention. The reference repository's [`mpc_wrapper.hpp`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/include/ommpc_core/mpc_wrapper.hpp) uses an uncondensed sparse QP; this implementation intentionally follows the paper's **condensed** form and reuses its OSQP API rather than copying the per-cycle setup/cleanup pattern. Baseline weights come from [`params.yaml`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_ros/config/params.yaml).
 
@@ -370,63 +376,51 @@ The condensed formulation follows the author [preprint](https://arxiv.org/html/2
 | --- | --- | --- | --- |
 | Subscribe, from bridge | `/uav/state` | `px4_msgs/msg/VehicleOdometry` | best effort, volatile, depth 1 |
 | Subscribe, from bridge | `/uav/status` | `px4_msgs/msg/VehicleStatus` | best effort, volatile, depth 1 |
-| Subscribe, from planner | `/uav/reference_trajectory` | `uav_ommpc_interfaces/msg/ReferenceTrajectory` | reliable, volatile, depth 1 |
+| Subscribe, from planner | `/uav/reference_polynomial` | `uav_ommpc_interfaces/msg/PolynomialTrajectory` | reliable, volatile, depth 1 |
 | Publish, to bridge | `/uav/control_input` | `uav_ommpc_interfaces/msg/ThrustRates` | reliable, volatile, depth 1 |
 
 There is no second odometry topic: `/uav/state` already contains the PX4 odometry. The node publishes neither arm/mode commands nor OffboardControlMode directly. Ensure **only one controller publishes `/uav/control_input`**; the bridge has no arbitration between competing publishers. Standard ROS remapping can isolate multiple vehicles or rename these topics.
 
-### Reference trajectory message and time
+### Polynomial message, timing and renewal
 
-`ReferenceState.msg` contains `float64[3] position`, `float64[3] velocity`, and a unit Hamilton `float64[4] q` in **w,x,y,z order**, body FRD to world NED. It is deliberately not a ROS geometry quaternion's xyzw order.
+This is a clean wire-interface cutover: the sampled `ReferenceState`/`ReferenceTrajectory` messages and `/uav/reference_trajectory` subscription are removed. There is no parallel legacy command source.
 
-`ReferenceTrajectory.msg` contains:
+`PolynomialTrajectory.msg` contains a `std_msgs/Header`, `hold_final`, and up to 100 `PolynomialSegment` entries. Each segment contains `duration` and bounded arrays `x`, `y`, `z`, `yaw` (1–10 ascending normalized-time coefficients). There is no message dt: the node samples at its configured `dt`.
 
-- `header.frame_id = "ned"`; positions use exactly the same local NED origin as the PX4 odometry.
-- `header.stamp`: the **ROS-clock time of the first state sample**, not PX4 boot time, and not the end of the trajectory.
-- `dt`: the uniform sample period in seconds, matching the node's `dt` within `1e-9`.
-- `states`: M+1 `ReferenceState` entries, at most 2001.
-- `inputs`: M `ThrustRates` feedforward entries, at most 2000. Each input drives the corresponding state to the next state using `dynamic.hpp`. M must be at least the controller horizon N.
+- `header.frame_id` must be `"ned"` and positions use the same local NED origin as odometry. ENU plans must be transformed upstream, not merely relabeled.
+- `header.stamp` is the ROS time of the first segment. Republishing the same plan renews its receipt watchdog **without changing that stamp**. A shifted rolling window must update both its coefficients and its start stamp.
+- New plans are validated/decoded once on receipt and cached immutably. A malformed replacement clears the previous plan; unsupported degree, discontinuous derivatives, nonfinite values and invalid terminal holds are rejected.
+- Each accepted odometry packet records its **ROS reception time**. The node pairs that state with reference samples at reception time plus `k*dt`, without floor indexing. PX4 boot timestamps are used only for freshness/replay checks. This does not compensate transport delay before receipt or predict an old state forward using an assumed actuator input.
+- Current time, the odometry reception anchor, steady-clock freshness and geometry validity are checked. Future plans wait; expired non-holding plans stop. A complete N-step horizon is required. An explicitly stationary hold may extend beyond the final segment while the receipt lease remains fresh.
+- Keep the existing default `reference_timeout=0.5 s` by periodically renewing the plan. A long geometric duration or `hold_final=true` is not permission to continue after losing the planner. Planner/controller ROS clocks must be consistent.
+- Successful solves are still checked against the period deadline and renewed safety gates; ordinary asynchronous planner/control timing is not treated as a failed sample-grid transition.
 
-At each control tick, `j = floor((ROS_now - header.stamp) / dt)` selects states `j..j+N` and inputs `j..j+N-1`. The complete window must exist. Future-start trajectories wait, and exhausted trajectories stop output: there is no interpolation, terminal-state hold, trajectory extrapolation or implicit position-to-attitude planner. The selection is quantized to the preceding sample (less than one dt of alignment error). The active window, not every future sample in a long message, is decoded and checked by the controller.
-
-Publish rolling trajectories, for example at 20–50 Hz with M=40 for the default N=20. A message containing exactly N inputs is usable only during its first sample interval; provide extra samples for delivery latency and the interval before the next reference update. Republishing a long trajectory may retain its original start stamp; sending an old message with a new stamp re-times that trajectory and is not equivalent. All upper-level publishers must use the same ROS time domain; synchronize clocks across computers.
-
-A position-only `nav_msgs/Path` is insufficient for this controller. It requires velocity, attitude and feedforward inputs that satisfy the discrete model. The model-consistent construction in `examples/ommpc_tracking.cpp` can be used by an upstream planner.
-
-Example message construction inside an existing Python ROS2 planner (publish through a reliable/volatile publisher and call again on each planner update):
+Example construction for a reference-only planner:
 
 ```python
-import math
-from uav_ommpc_interfaces.msg import ReferenceState, ReferenceTrajectory, ThrustRates
+from uav_ommpc_interfaces.msg import PolynomialSegment, PolynomialTrajectory
 
-def hover_reference(node, position_ned, yaw_rad):
-    msg = ReferenceTrajectory()
-    msg.header.frame_id = "ned"
-    msg.header.stamp = node.get_clock().now().to_msg()
-    msg.dt = 0.02
-    q = [math.cos(yaw_rad / 2), 0.0, 0.0, math.sin(yaw_rad / 2)]
-    msg.states = [
-        ReferenceState(position=list(position_ned), velocity=[0.0, 0.0, 0.0], q=q)
-        for _ in range(41)
-    ]
-    msg.inputs = [
-        ThrustRates(thrust_acceleration=9.80665, body_rates=[0.0, 0.0, 0.0])
-        for _ in range(40)
-    ]
-    return msg
+msg = PolynomialTrajectory()
+msg.header.frame_id = "ned"
+msg.header.stamp = node.get_clock().now().to_msg()  # Set once for this plan.
+msg.hold_final = True
+msg.segments = [
+    PolynomialSegment(duration=1.0, x=[north], y=[east], z=[down], yaw=[yaw_rad])
+]
+# Periodically publish msg on /uav/reference_polynomial without restamping it.
 ```
 
-The hover position/yaw are explicit application choices in the current local frame, not automatically inferred takeoff targets. This example matches the default gravity/dt. Do not use an arbitrary origin or run a test publisher against an aircraft.
+This is an explicit hover target, not automatic takeoff or origin selection. For moving paths use analytic polynomial coefficients; jerk and yaw rate supply the feedforward body rates. A nonstationary endpoint cannot request a terminal hold.
 
 ### State conversion and output gating
 
 - Odometry pose frame must be `POSE_FRAME_NED`. Velocity may be `VELOCITY_FRAME_NED`, or `VELOCITY_FRAME_BODY_FRD`, in which case it is rotated by the body-to-world attitude. Arbitrary-heading FRD navigation frames and unknown frames are rejected; no ENU/FLU conversion is performed.
-- Position, velocity and quaternion must be finite. Quaternion norm must be within `1e-3` of one for float32 PX4 odometry, or `1e-6` for float64 reference states. Accepted quaternions are normalized before conversion to SO(3). Zero/nonunit quaternions are not repaired.
+- Odometry position, velocity and quaternion must be finite. Quaternion norm must be within `1e-3` of one; accepted float32 PX4 quaternions are normalized. Polynomial attitude is computed from analytic acceleration/jerk/yaw instead of received reference quaternions.
 - The installed PX4 message labels `quality` as unused; its default zero is **not** used to reject otherwise valid odometry. Measured angular velocity and covariance are not consumed by this p/v/R model.
 - PX4 `timestamp_sample` must be positive, no greater than the message timestamp, and strictly advance before refreshing the odometry cache. Status timestamps must also advance. These boot-time values are never compared to ROS wall time. Duplicates/out-of-order packets do not refresh freshness. Restart the node after PX4 reboots and its timestamps return to a smaller epoch.
 - Fresh valid odometry, fresh reference receipt and fresh healthy vehicle status are all required. Vehicle status must report rotary-wing operation, not a VTOL transition, no failsafe and no termination mode. A fresh invalid odometry packet invalidates the cached state rather than continuing on its old value.
 - A changed odometry `reset_counter` invalidates the cached reference. The planner must publish a new trajectory in the updated local frame; the node cannot determine whether the planner actually corrected its origin. A backward ROS clock jump also invalidates the reference.
-- Malformed replacement reference metadata invalidates the old plan. Invalid selected poses, inconsistent dynamics, out-of-bound feedforward or solver failure produce **no control message**. Normal periodic solves resume only when the selected inputs are usable; no zero-thrust or last-solution fallback is generated.
+- Malformed polynomial metadata/coefficients invalidate the old plan. Invalid geometry, unavailable full horizons, excessive dynamics defects, out-of-bound feedforward or solver failure produce **no control message**. No zero-thrust or last-solution fallback is generated.
 - After solving, the node checks freshness and remaining horizon coverage again. A solve exceeding one timer period, an expired input, clock rollback or exhausted reference is discarded. Merely crossing a reference sample boundary during a timely solve is allowed: asynchronous planner/control phases must not suppress otherwise valid commands.
 
 The node deliberately does **not** require armed/Offboard status: valid pre-Offboard inputs let the bridge prime its heartbeat. The unchanged bridge only forwards angular-rate setpoints while PX4 reports Offboard. Neither node requests arming or a flight mode.
@@ -449,6 +443,7 @@ All controller/timeout parameters are **read-only after startup**. Restart the n
 | `input_min`, `input_max` | Four-element `[thrust, wx, wy, wz]` bounds; same defaults as the controller library |
 | `max_iterations` | `400` |
 | `absolute_tolerance`, `relative_tolerance` | `1e-5`, `1e-5` |
+| `max_position_defect`, `max_velocity_defect`, `max_attitude_defect` | `0.05 m`, `0.25 m/s`, `0.1 rad` per-step local-model defect limits |
 
 The node accepts dt in `[1e-6,1]` seconds for representable timer configuration; that is not a guarantee of achieving those rates. Keep the intended 0.02 s step unless timing, horizon, reference generation and vehicle limits are retuned together. Timeouts must be finite and positive. Keep MPC input bounds consistent with bridge limits and vehicle calibration.
 
@@ -466,29 +461,14 @@ ros2 run uav_ommpc_ros ommpc_node --ros-args \
 
 The PX4/DDS transport and an upper-level trajectory publisher are separate prerequisites. The node does not start them. If using `use_sim_time`, odometry transport, planner and controller must share the intended clock; no control is produced before ROS time is positive. Never run the old test-flight controller concurrently with `ommpc_node`.
 
-### Observed ROS integration verification
+### Verification scope
 
-All three packages built on Jetson. `colcon test-result --verbose` reported **61 tests, 0 errors, 0 failures, 0 skipped**, including the 14 new frame/quaternion/reference-window tests, existing bridge tests and controller tests.
+The complete polynomial ROS graph passed using actual installed node/bridge processes, synthetic PX4 telemetry, ROS_DOMAIN_ID=173 and localhost-only discovery. Checks included nonzero acceleration/yaw references, a segment knot, pre-Offboard heartbeat priming, Offboard thrust/rate mapping, malformed coefficients/frames/durations, discontinuity rejection, invalid stationary holds, future/exhausted plans, reference lease expiry, invalid/frozen odometry, failsafe, estimator resets and a real OSQP iteration-limit failure. It observed 419 controller outputs, 704 downstream rates and zero VehicleCommands; logs are at `/tmp/polynomial-ros-7lxgzpyd`.
 
-An isolated smoke scenario ran the **actual installed `ommpc_node` and `px4_bridge` processes** with ROS_DOMAIN_ID=173 and localhost-only discovery. It supplied synthetic PX4 odometry/status and timed planner messages; no DDS Agent, PX4 simulator or physical aircraft was connected. Status remained DISARMED. No VehicleCommand was published or observed.
+A second isolated run exercised the **actual migrated Python publisher** in all four modes through the C++ sampler/controller/bridge. All modes produced fresh commands. It also exercised SITL reference evaluation/CSV recording without entering the flight state machine, and verified that a backward ROS clock jump clears a still-fresh plan until a new plan receipt. No flight commands were sent; logs are at `/tmp/polynomial-ros-04djq4mc`. Temporary smoke programs were removed afterward.
 
-| Exercised path | Observed result |
-| --- | --- |
-| No upper-level reference | No controller output, bridge heartbeat or rate setpoint |
-| Valid inputs in POSCTL | Solver produced ThrustRates; bridge primed heartbeat but emitted no rate setpoints |
-| Synthetic OFFBOARD status | Bridge emitted rates and normalized thrust matching actual controller outputs |
-| Position error `[0.2,-0.1,0.1] m` about a hover reference | Approximately `12 m/s²`, body rates `[2.085712,3.000000,0] rad/s` |
-| Reversed horizontal position errors | Roll/pitch correction signs reversed |
-| Consistent constant-velocity reference | Solver and bridge outputs continued |
-| Invalid/NaN odometry, frozen/out-of-order samples, stopped telemetry/status | Controller stopped; bridge became quiet after its 0.5 s command timeout |
-| Failsafe, VTOL transition, fixed-wing or termination status | No continued controller output |
-| Bad reference frame/dt/quaternion/count, inconsistent dynamics, future/exhausted reference, stopped publisher | No continued controller output |
-| Estimator reset | Reference invalidated while still fresh; silence observed at age 0.121 s, below the 0.20 s test timeout; a new reference restored operation |
-| `max_iterations=1` with nonzero tracking error | Actual node log reported `OSQP=-2, iterations=1`; no command or downstream heartbeat/rate output |
+The historical PX4/Gazebo flight records later in this README were obtained with the previous sampled-reference implementation; they are not a flight certification of the polynomial cutover.
 
-The scenario used shorter test timeouts (`odometry_timeout=0.12`, `status_timeout=0.35`, `reference_timeout=0.20`) and checked their parameter values/read-only descriptor through ROS services. Across its phases it observed 1,604 bridged odometry messages, 1,592 statuses, 359 controller commands, 912 heartbeats, 875 downstream rate messages, and zero VehicleCommands. Process logs were retained at `/tmp/ommpc-node-smoke-gxdhnoyk`; the temporary scenario program was removed after verification.
-
-This verifies ROS message generation, QoS compatibility, actual solver invocation, bridge conversion and failure gating. It is **not** a new SITL flight or real-hardware validation; earlier flight results below belong to the bridge's separate test controller.
 
 ## Build and environment
 
@@ -535,7 +515,7 @@ All topics use volatile durability and depth 1; no commands are retained for fut
 | `/uav/status` | `px4_msgs/msg/VehicleStatus` | best effort | Unmodified PX4 vehicle status |
 | `/uav/command_ack` | `px4_msgs/msg/VehicleCommandAck` | best effort | Unmodified PX4 command acknowledgements |
 | `/uav/vehicle_command` | `px4_msgs/msg/VehicleCommand` | reliable | Explicit mode/arm/land/etc. request |
-| `/uav/reference_trajectory` | `uav_ommpc_interfaces/msg/ReferenceTrajectory` | reliable | Timed full-state and feedforward trajectory for `ommpc_node` |
+| `/uav/reference_polynomial` | `uav_ommpc_interfaces/msg/PolynomialTrajectory` | reliable | Timed normalized polynomial segments for `ommpc_node` |
 
 `ThrustRates` fields:
 
@@ -583,7 +563,7 @@ The bridge does not send zero thrust, land, disarm, retry, or choose recovery mo
 
 ## Unit tests
 
-Bridge input validation, limits and timeout logic live in `uav_ommpc_ros/src/command_state.hpp` and use injected time in tests. `src/ommpc_inputs.hpp` adds the node's odometry/reference decoding and timestamp-window helpers; tests cover NED/BODY_FRD velocity, Hamilton quaternion order/precision, invalid data and overflow-safe window boundaries. Neither test suite needs running ROS/PX4 processes:
+Bridge input validation, limits and timeout logic live in `uav_ommpc_ros/src/command_state.hpp` and use injected time in tests. `src/ommpc_inputs.hpp` tests odometry decoding, polynomial metadata/construction, continuous reception-time anchors, explicit holds and expiry. These unit tests do not require running ROS/PX4 processes.
 
 ```bash
 cd ~/uav_control_ws
@@ -593,7 +573,7 @@ colcon test-result --verbose --test-result-base build/uav_ommpc_ros
 
 ## Reference test publisher and OMMPC SITL experiments
 
-`tools/reference_test_publisher.py` publishes only `/uav/reference_trajectory` using the same message as an upper-level planner. It never arms, changes modes or publishes `/uav/control_input`.
+`tools/reference_test_publisher.py` publishes only `/uav/reference_polynomial`, using the same polynomial message as an upper-level planner. It never arms, changes modes or publishes `/uav/control_input`.
 
 | Mode | Reference behavior |
 | --- | --- |
@@ -602,11 +582,11 @@ colcon test-result --verbose --test-result-base build/uav_ommpc_ros
 | `constant_velocity` | Smooth speed ramp, constant-speed straight segment, smooth braking, then endpoint hold |
 | `circle` | Smooth angular-speed ramp, then a horizontal circle at fixed yaw |
 
-`polynomial` is intentionally **not a selectable mode**; it is deferred, not a no-op implementation.
+All four geometry modes now publish real polynomial coefficients; `polynomial` is the transport representation, not a separate geometry selector.
 
 ### Trajectory construction and publisher CLI
 
-The publisher generates uniformly sampled positions, computes `v_k=(p_{k+1}-p_k)/dt` and `a_k=(v_{k+1}-v_k)/dt`, aligns body Z with `g*e3-a_k`, then derives thrust magnitude and `omega_k=Log(R_k.transpose()*R_{k+1})/dt`. Quaternions use wxyz double precision, so every published horizon satisfies the existing nonlinear discrete model. It refuses feedforward outside thrust `[1,12] m/s²` or rate `±[3,3,1.5] rad/s`, instead of clipping and breaking reference consistency.
+The publisher uses analytic p/v/a/j to build normalized degree-7 Hermite pieces on shared global knots, splitting at speed-ramp boundaries. Velocity, acceleration and body rates for diagnostics are evaluated from those polynomials, not forward differences. It checks C3/C1 continuity, terminal holds and sampled feedforward bounds `[1,12] m/s²` / `±[3,3,1.5] rad/s`. These sampled checks are not a certificate of between-sample actuator feasibility; the controller checks every input it uses.
 
 The target step is a change of **desired equilibrium between messages**, not a state teleport inside one horizon. Its instantaneous reference error is expected in the step-test metrics. The trajectory before/after the step is dynamically consistent in each message.
 
@@ -631,9 +611,9 @@ python3 tools/reference_test_publisher.py --mode constant_velocity --speed 0.3 -
 python3 tools/reference_test_publisher.py --mode circle --radius 0.6 --speed 0.25
 ```
 
-Run only **one reference publisher** at a time. `--origin N E D` and `--yaw RAD` explicitly override captured odometry values; default yaw preserves the current heading. Defaults are `dt=0.02`, `samples=60` input samples plus 61 states, and `rate=25 Hz`. `samples` must cover the node's actual horizon. `--duration SECONDS` stops publishing after a bounded interval; it **does not land**. Stopping or Ctrl-C eventually triggers the existing controller/bridge timeouts, not a controlled recovery. A generation error stops publishing with a clear error/nonzero exit.
+Run only **one reference publisher** at a time. `--origin N E D` and `--yaw RAD` override captured odometry values; default yaw preserves heading. The removed `--dt`/`--samples` arguments are replaced by `--window` (default 4 seconds) and `--segment-duration` (default 0.5 seconds); `--rate` remains 25 Hz. Window length must cover the controller horizon and transport delay. Overlapping windows retain common knots and analytic geometry.
 
-ROS time is used consistently for the horizon stamp/trajectory phase. A new message is stamped at its first sample, not at the original trajectory start. The reference-only publisher does not monitor flight status or provide a flight safety state machine.
+Repeated cached plans retain their start stamp and renew the receipt lease. As a rolling window shifts, its start stamp advances by the same amount as its coefficient domain; publication time never silently restarts the path. `--duration SECONDS` stops publication but does **not** land. Ctrl-C, lease expiry or generation failure leads to the existing node/bridge timeout behavior, not a controlled recovery. The reference-only publisher is not a flight safety state machine.
 
 ### SITL-specific tuning and time-boundary correction
 
@@ -681,13 +661,13 @@ Safety/acceptance checks remain explicit: fresh odometry <=0.2 s and status <=1.
 
 ### Metrics and recordings
 
-The runner writes `result.json`, aggregate `trace.csv`, each phase's JSON/CSV, complete published horizon samples in `reference.csv`, actual OMMPC commands in `control_input.csv`, and PX4-facing outputs in `bridge_rates.csv`. Position/velocity errors use the current time-selected reference sample (floor indexing), not a future horizon endpoint. Metrics include phase RMSE/max error, observed speed/tilt/yaw, command gaps, bound violations, fresh telemetry counts, ACKs and final landing state. Missing values are recorded as null rather than fabricated zeros.
+The runner writes `result.json`, aggregate `trace.csv`, phase JSON/CSV, analytically evaluated reference diagnostics in `reference.csv`, actual OMMPC commands in `control_input.csv`, and PX4-facing outputs in `bridge_rates.csv`. Tracking errors use the reference evaluated continuously at each odometry reception time. CSV fields now include `reference_elapsed_s`, not a floor-grid index/sample age; full polynomial coefficients are retained in the reference topic when recording a bag. Missing values remain null rather than fabricated zeros.
 
 `--record-bag` records 13 reference/telemetry/control/command/acknowledgement topics into `bag/` and closes the recorder via SIGINT with bounded cleanup. Check `rosbag.log` and `ros2 bag info RUN_DIR/bag`. Bags include command topics: **never replay them into a live aircraft or an active control domain**. Analyze offline or use an isolated domain and explicit non-command topic selection.
 
 The current node does not publish per-solve iteration/latency diagnostics. Stable solving is evidenced here by actual continuous OMMPC output, gap metrics and retained node logs; these are not fabricated per-QP timing or failure counters.
 
-### Observed PX4/Gazebo results
+### Historical PX4/Gazebo results — sampled-reference version
 
 Successful evidence directories on Jetson:
 
@@ -705,7 +685,7 @@ Both runs report `passed=true`, accepted Offboard/arm/land transitions, and conf
 
 Every phase observed zero input-bound violations and zero control gaps above 0.1 s. Maximum observed model-estimated speeds were 0.3112 m/s on the straight line and 0.2537 m/s on the circle. The circle phase covered more than one revolution after its smooth start. Controller logs show no solver-failure warnings during the successful tracking sequence; one estimator-reset event during takeoff paused control until the next reference, as designed.
 
-Both successful MCAP bags were inspected: hover 4.3 MiB / 9,120 messages; tracking 15.6 MiB / 29,429 messages. Node logs are copied into the corresponding experiment directories. Failed attempts `hover-01` and `tracking-01` are retained, not overwritten. An independent six-test trajectory suite passed, including yaw near pi, step-equilibrium semantics, line terminal hold, circle geometry, nonlinear discrete consistency and infeasible-feedforward rejection. The existing colcon suite still reports 61 tests with no failures after the node timing correction.
+Both successful MCAP bags were inspected: hover 4.3 MiB / 9,120 messages; tracking 15.6 MiB / 29,429 messages. Node logs are copied into the corresponding experiment directories. Failed attempts `hover-01` and `tracking-01` are retained, not overwritten. At the time of those sampled-reference flights, the six-test trajectory suite and 61-test colcon report passed. The new polynomial verification results above are separate; these flight records were not rerun or relabeled as polynomial flights.
 
 These are actual simulated PX4/Gazebo flights through the OMMPC ROS node, **not** merely matched-model closed-loop examples. They establish low-speed SITL behavior only; actuator-model mismatch, estimation, inner-loop delay and hardware safety require separate real-aircraft validation.
 
