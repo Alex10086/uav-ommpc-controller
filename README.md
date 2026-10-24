@@ -392,6 +392,7 @@ This is a clean wire-interface cutover: the sampled `ReferenceState`/`ReferenceT
 - New plans are validated/decoded once on receipt and cached immutably. A malformed replacement clears the previous plan; unsupported degree, discontinuous derivatives, nonfinite values and invalid terminal holds are rejected.
 - Each accepted odometry packet records its **ROS reception time**. The node pairs that state with reference samples at reception time plus `k*dt`, without floor indexing. PX4 boot timestamps are used only for freshness/replay checks. This does not compensate transport delay before receipt or predict an old state forward using an assumed actuator input.
 - Current time, the odometry reception anchor, steady-clock freshness and geometry validity are checked. Future plans wait; expired non-holding plans stop. A complete N-step horizon is required. An explicitly stationary hold may extend beyond the final segment while the receipt lease remains fresh.
+- An odometry receipt stamp within **one control period** before the plan start is treated as plan time zero instead of being rejected. This absorbs publisher/subscriber clock skew and scheduling jitter without pretending to know the transport delay; anything older is still refused.
 - Keep the existing default `reference_timeout=0.5 s` by periodically renewing the plan. A long geometric duration or `hold_final=true` is not permission to continue after losing the planner. Planner/controller ROS clocks must be consistent.
 - Successful solves are still checked against the period deadline and renewed safety gates; ordinary asynchronous planner/control timing is not treated as a failed sample-grid transition.
 
@@ -581,8 +582,11 @@ colcon test-result --verbose --test-result-base build/uav_ommpc_ros
 | `target_step` | After `--start-delay`, switch the entire horizon to a displaced hover equilibrium; default offset `[0.6,0.3,0] m` |
 | `constant_velocity` | Smooth speed ramp, constant-speed straight segment, smooth braking, then endpoint hold |
 | `circle` | Smooth angular-speed ramp, then a horizontal circle at fixed yaw |
+| `hover_to_hover` | Degree-7 blend between two hover equilibria with zero velocity, acceleration and jerk at both ends; duration `35/16 * distance / speed`, so `--speed` is the exact peak speed |
 
-All four geometry modes now publish real polynomial coefficients; `polynomial` is the transport representation, not a separate geometry selector.
+All five geometry modes now publish real polynomial coefficients; `polynomial` is the transport representation, not a separate geometry selector.
+
+`hover_to_hover` is the smoothness benchmark. Peak speed equals `--speed` exactly halfway through the displacement, and duration scales as `distance/speed`, so raising `--speed` shortens the blend and increases peak acceleration roughly with `speed²`. The displacement comes from `--offset N E D`.
 
 ### Trajectory construction and publisher CLI
 
@@ -602,6 +606,7 @@ python3 tools/reference_test_publisher.py --mode hover --check
 python3 tools/reference_test_publisher.py --mode target_step --check
 python3 tools/reference_test_publisher.py --mode constant_velocity --check
 python3 tools/reference_test_publisher.py --mode circle --speed 0.25 --check
+python3 tools/reference_test_publisher.py --mode hover_to_hover --speed 0.4 --check
 python3 -m unittest discover -s tools -p test_reference_test_publisher.py -v
 
 # Reference-only publishing; waits for valid odometry to capture unspecified origin/yaw.
@@ -609,9 +614,12 @@ python3 tools/reference_test_publisher.py --mode hover
 python3 tools/reference_test_publisher.py --mode target_step --offset 0.6 0.3 0
 python3 tools/reference_test_publisher.py --mode constant_velocity --speed 0.3 --direction 1 0 0
 python3 tools/reference_test_publisher.py --mode circle --radius 0.6 --speed 0.25
+python3 tools/reference_test_publisher.py --mode hover_to_hover --offset 2 0 0 --speed 0.4
 ```
 
 Run only **one reference publisher** at a time. `--origin N E D` and `--yaw RAD` override captured odometry values; default yaw preserves heading. The removed `--dt`/`--samples` arguments are replaced by `--window` (default 4 seconds) and `--segment-duration` (default 0.5 seconds); `--rate` remains 25 Hz. Window length must cover the controller horizon and transport delay. Overlapping windows retain common knots and analytic geometry.
+
+`tools/sitl_hover_to_hover_sweep.sh` repeats a full takeoff → `hover_to_hover` → native-landing flight for each speed in `SPEEDS` (default `0.4 0.8 1.2 1.6`), restarting PX4 between points so every run starts landed and disarmed. Each point consumes a complete simulated flight; it is not a substitute for a dedicated hardware test campaign.
 
 Repeated cached plans retain their start stamp and renew the receipt lease. As a rolling window shifts, its start stamp advances by the same amount as its coefficient domain; publication time never silently restarts the path. `--duration SECONDS` stops publication but does **not** land. Ctrl-C, lease expiry or generation failure leads to the existing node/bridge timeout behavior, not a controlled recovery. The reference-only publisher is not a flight safety state machine.
 
@@ -666,6 +674,40 @@ The runner writes `result.json`, aggregate `trace.csv`, phase JSON/CSV, analytic
 `--record-bag` records 13 reference/telemetry/control/command/acknowledgement topics into `bag/` and closes the recorder via SIGINT with bounded cleanup. Check `rosbag.log` and `ros2 bag info RUN_DIR/bag`. Bags include command topics: **never replay them into a live aircraft or an active control domain**. Analyze offline or use an isolated domain and explicit non-command topic selection.
 
 The current node does not publish per-solve iteration/latency diagnostics. Stable solving is evidenced here by actual continuous OMMPC output, gap metrics and retained node logs; these are not fabricated per-QP timing or failure counters.
+
+### Observed PX4/Gazebo results — polynomial version
+
+`tools/sitl_ommpc_test.py` drove the real SITL stack (PX4 v1.17, Gazebo Harmonic x500, Micro XRCE-DDS, `px4_bridge hover_thrust=0.728744`, `ommpc_node` with `ommpc_sitl.yaml`) through the **polynomial** interface only. Every flight below started from a fresh PX4 process, a disarmed and stationary vehicle, and ended in native `NAV_LAND` with observed disarmed status.
+
+Run `poly-four-modes-02` (`--modes hover target_step constant_velocity circle`, 92.4 s, `passed=true`, takeoff height 2.04 m):
+
+| Phase | Position RMSE (m) | Max error (m) | Velocity RMSE (m/s) | Max tilt (rad) | Max speed (m/s) | Bound violations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Polynomial takeoff | 0.0325 | 0.0492 | 0.0111 | 0.0033 | 0.3898 | 0 |
+| Hover, 5 s stable | 0.0255 | 0.0343 | 0.0105 | 0.0040 | 0.0157 | 0 |
+| Target step `[0.6,0.3,0] m` | 0.3146 | 0.6754 | 0.0861 | 0.0442 | 0.2029 | 0 |
+| Straight line, 0.3 m/s | 0.0462 | 0.0871 | 0.0139 | 0.0194 | 0.3089 | 0 |
+| Circle, radius 0.6 m / 0.25 m/s | 0.0612 | 0.1246 | 0.0395 | 0.0483 | 0.2574 | 0 |
+
+The target step deliberately commands an instantaneous equilibrium change, so its large RMSE is the expected step response, not tracking failure. The moving phases tracked within 9 cm maximum error and 4 cm/s velocity RMSE. Across the whole run the bridge emitted 4,182 rate setpoints for 4,207 OMMPC commands and no input-bound violation was recorded. One 0.109 s control gap appeared during the circle phase, marginally above the 0.1 s advisory threshold and consistent with Python-side scheduling under rosbag recording; the acceptance limit is 0.3 s.
+
+These are **simulated** flights. They establish low-speed SITL tracking with the polynomial reference path only; actuator-model mismatch, estimator error, inner-loop delay and hardware safety still require separate real-aircraft validation.
+
+#### Degree-7 hover-to-hover smoothness and speed sweep
+
+`tools/sitl_hover_to_hover_sweep.sh` flew the same 2 m `hover_to_hover` blend five times, restarting PX4 before each point so every flight began landed and disarmed. Each run includes a polynomial takeoff to 2 m, the blend, a 5 s settle within 0.35 m / 0.3 m/s / 0.25 rad / 0.2 rad, then native landing.
+
+| Commanded peak speed (m/s) | Peak reference speed observed | Position RMSE (m) | Max position error (m) | Velocity RMSE (m/s) | Max tilt (rad) | Max thrust (m/s²) | Result |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 0.4 | 0.4000 | 0.0515 | 0.1030 | 0.0165 | 0.0137 | 9.8143 | pass |
+| 0.8 | 0.8000 | 0.0807 | 0.1757 | 0.0318 | 0.0498 | 9.8154 | pass |
+| 1.2 | 1.2000 | 0.0728 | 0.1747 | 0.0457 | 0.1258 | 9.8448 | pass |
+| 1.6 | 1.6000 | 0.0978 | 0.2429 | 0.0845 | 0.2499 | 9.9949 | pass |
+| 2.0 | 2.0000 | 0.1201 | 0.3201 | 0.1327 | 0.3968 | 10.3082 | pass |
+
+Every point held zero input-bound violations, zero control gaps above 0.1 s, and a full 5 s settled window before landing. Tracking degrades monotonically with speed while the reference stays exactly on the requested peak: position RMSE grows from 5 cm to 12 cm and peak tilt from 0.014 to 0.397 rad. At 2.0 m/s the tilt reaches roughly 44% of the unchanged 0.6 rad abort threshold, so that point is the practical edge of this low-gain `ommpc_sitl.yaml` tuning rather than a demonstrated ceiling.
+
+The first sweep attempt exposed a real bug: `hover_to_hover` durations were floored at `ramp` (3 s), so 1.6 and 2.0 m/s silently published the *same* 1.458 m/s reference. Duration is now `35/16 * distance / speed` with no floor, the observed peak reference speed tracks the request exactly, and a unit test pins that regression.
 
 ### Historical PX4/Gazebo results — sampled-reference version
 

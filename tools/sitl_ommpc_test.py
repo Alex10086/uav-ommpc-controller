@@ -28,7 +28,7 @@ from px4_msgs.msg import (VehicleOdometry, VehicleStatus, VehicleCommand,
 from uav_ommpc_interfaces.msg import ThrustRates
 from reference_test_publisher import ReferencePublisher, sample_reference
 
-MODES = ('hover', 'target_step', 'constant_velocity', 'circle')
+MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover')
 TOPICS = ('/uav/reference_polynomial', '/uav/state', '/uav/status',
           '/uav/control_input', '/uav/vehicle_command', '/uav/command_ack',
           '/fmu/out/vehicle_odometry', '/fmu/out/vehicle_status_v1',
@@ -281,12 +281,22 @@ class Flight(ReferencePublisher):
 
     def f_fresh(self):
         now = time.monotonic()
-        return (self.f_state is not None and self.f_status is not None and
-                now-self.f_state_at < .2 and now-self.f_status_at < 1.5 and
-                now-self.f_raw_state_at < .2 and now-self.f_raw_status_at < 1.5)
+        c1 = self.f_state is not None
+        c2 = self.f_status is not None
+        c3 = now-self.f_state_at < .2
+        c4 = now-self.f_status_at < 1.5
+        c5 = now-self.f_raw_state_at < .2
+        c6 = now-self.f_raw_status_at < 1.5
+        if not (c1 and c2 and c3 and c4 and c5 and c6):
+            if self.f_active and not self.f_landing:
+                print(f"FRESH_FAIL: state_age={now-self.f_state_at:.4f} status_age={now-self.f_status_at:.4f} raw_state_age={now-self.f_raw_state_at:.4f} raw_status_age={now-self.f_raw_status_at:.4f}", flush=True)
+            return False
+        return True
 
     def f_tick(self):
-        rclpy.spin_once(self, timeout_sec=.005)
+        rclpy.spin_once(self, timeout_sec=.003)
+        for _ in range(15):
+            rclpy.spin_once(self, timeout_sec=0.0)
         self.f_record_reference()
         if not self.f_active or self.f_landing:
             return
@@ -430,10 +440,18 @@ class Flight(ReferencePublisher):
             if selected is None:
                 raise RuntimeError('Missing circle reference at completion')
             self.f_settle(np.array(selected[0].position))
+        elif mode == 'hover_to_hover':
+            self.set_trajectory(mode, origin, self.f_yaw)
+            dist = float(np.linalg.norm(self.config['offset']))
+            duration = self.config['start_delay'] + (35.0/16.0)*dist/self.config['speed']
+            end = time.monotonic()+duration+.5
+            self.f_until(lambda: time.monotonic() >= end, duration+4., 'smooth degree-7 hover-to-hover trajectory')
+            terminal = origin+self.config['offset']
+            self.f_settle(terminal)
         metrics = self.f_metrics(mode)
         if metrics['position_error_max'] is None or metrics['position_error_max'] > 1.:
             raise RuntimeError(f'{mode}: maximum tracking error exceeds 1 m')
-        if mode in ('constant_velocity', 'circle'):
+        if mode in ('constant_velocity', 'circle', 'hover_to_hover'):
             if metrics['position_error_rmse'] > .35 or metrics['velocity_error_rmse'] > .3:
                 raise RuntimeError(f'{mode}: moving tracking RMSE exceeds position/velocity limits')
         self.f_phase_done()
@@ -507,16 +525,20 @@ class Flight(ReferencePublisher):
         self.f_active = True
         self.f_phase_done()
         self.f_phase_start('ramped_takeoff')
-        start = time.monotonic()
-        duration = 2./.3
-        last_update = -math.inf
-        while time.monotonic()-start < duration:
-            now = time.monotonic()
-            if now-last_update >= .04:
-                self.f_set_hover(self.f_ground+np.array([0., 0., -min(2., .3*(now-start))]))
-                last_update = now
-            self.f_tick()
         airborne = self.f_ground+np.array([0., 0., -2.])
+        saved_offset = np.asarray(self.config['offset'], dtype=float).copy()
+        saved_speed = float(self.config['speed'])
+        saved_delay = float(self.config['start_delay'])
+        self.config['offset'] = np.array([0., 0., -2.])
+        self.config['speed'] = 0.4
+        self.config['start_delay'] = 0.5
+        self.set_trajectory('hover_to_hover', self.f_ground, self.f_yaw)
+        takeoff_duration = self.config['start_delay'] + (35.0/16.0)*2.0/0.4
+        end = time.monotonic()+takeoff_duration+.5
+        self.f_until(lambda: time.monotonic() >= end, takeoff_duration+5., 'smooth degree-7 polynomial takeoff')
+        self.config['offset'] = saved_offset
+        self.config['speed'] = saved_speed
+        self.config['start_delay'] = saved_delay
         self.f_settle(airborne)
         self.f_phase_done()
         for mode in self.f_modes:
@@ -617,10 +639,12 @@ def main():
                         help='Confirm ONLY the intended simulated PX4 is reachable in this DDS domain')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--mode', choices=MODES, help='Run one mode after takeoff')
-    selection.add_argument('--modes', choices=MODES, nargs='+', help='Run selected modes in sequence (default: all four)')
+    selection.add_argument('--modes', choices=MODES, nargs='+', help='Run selected modes in sequence (default: all five)')
     parser.add_argument('--output-dir', type=Path,
                         help='New directory; must not exist. Default: timestamped under ~/uav_control_ws/ommpc-flight-results')
     parser.add_argument('--record-bag', action='store_true', help='Record essential reference/state/status/control/PX4 topics')
+    parser.add_argument('--speed', type=float, default=None, help='Target speed for moving modes (e.g. hover_to_hover)')
+    parser.add_argument('--offset', type=float, nargs=3, default=None, help='Displacement offset N E D for target_step/hover_to_hover')
     args = parser.parse_args()
     modes = [args.mode] if args.mode else (args.modes or list(MODES))
     if len(modes) != len(set(modes)):
@@ -633,6 +657,10 @@ def main():
     bag = bag_log = None
     try:
         flight = Flight(out, modes)
+        if args.speed is not None:
+            flight.config['speed'] = float(args.speed)
+        if args.offset is not None:
+            flight.config['offset'] = np.array(args.offset, dtype=float)
         if args.record_bag:
             bag, bag_log = start_bag(out)
             flight.f_until(lambda: (out/'bag').is_dir() or bag.poll() is not None, 10., 'rosbag recorder startup')

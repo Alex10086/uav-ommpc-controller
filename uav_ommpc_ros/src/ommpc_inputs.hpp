@@ -79,9 +79,16 @@ decode_polynomial(
   return result;
 }
 
-inline std::optional<double> reference_elapsed(std::int64_t now_ns, std::int64_t start_ns)
+inline std::optional<double> reference_elapsed(
+  std::int64_t now_ns, std::int64_t start_ns, std::int64_t tolerance_ns = 0)
 {
-  if (start_ns <= 0 || now_ns < start_ns) return std::nullopt;
+  if (now_ns <= 0 || start_ns <= 0) return std::nullopt;
+  if (now_ns < start_ns) {
+    if (start_ns - now_ns <= tolerance_ns) {
+      return 0.0;
+    }
+    return std::nullopt;
+  }
   // Positive ordered timestamps keep the subtraction within int64 range.
   return static_cast<double>(now_ns - start_ns) * 1e-9;
 }

@@ -70,6 +70,34 @@ class PolynomialTrajectoryTests(unittest.TestCase):
         np.testing.assert_allclose(state.position, [0., 3.3, 0.], atol=1e-12)
         np.testing.assert_allclose(state.velocity, np.zeros(3), atol=1e-12)
 
+
+    def test_hover_to_hover_seventh_order_smoothness_and_speed_scaling(self):
+        offset = np.array([1.2, -0.6, 0.0])
+        dist = float(np.linalg.norm(offset))
+        for speed in [0.4, 0.8, 1.2]:
+            trajectory = Trajectory('hover_to_hover', origin=[0., 0., -2.], offset=offset,
+                                    speed=speed, start_delay=1.0, ramp=0.5)
+            duration = (35.0/16.0)*dist/speed
+            mid_flat = trajectory.flat(1.0 + 0.5*duration)
+            self.assertAlmostEqual(float(np.linalg.norm(mid_flat.velocity)), speed, places=9)
+            # The speed request, not the ramp floor, sets duration and peak speed.
+            fast = Trajectory('hover_to_hover', origin=[0., 0., -2.], offset=[2., 0., 0.],
+                              speed=2.0, start_delay=1.0, ramp=3.0)
+            fast_duration = (35.0/16.0)*2.0/2.0
+            fast_mid = fast.flat(1.0 + 0.5*fast_duration)
+            self.assertAlmostEqual(float(np.linalg.norm(fast_mid.velocity)), 2.0, places=9)
+            self.assertAlmostEqual(
+                float(np.linalg.norm(fast.flat(1.0 + fast_duration).position-[2., 0., -2.])), 0.0, places=12)
+            for endpoint in [1.0, 1.0 + duration]:
+                end_flat = trajectory.flat(endpoint)
+                np.testing.assert_allclose(end_flat.velocity, np.zeros(3), atol=1e-12)
+                np.testing.assert_allclose(end_flat.acceleration, np.zeros(3), atol=1e-12)
+                np.testing.assert_allclose(end_flat.jerk, np.zeros(3), atol=1e-12)
+            msg_end = trajectory.message(10**9, 1.0 + duration + 1.0)
+            self.assertTrue(msg_end.hold_final)
+            state_end = sample_reference(msg_end, 50.)
+            np.testing.assert_allclose(state_end.position, np.array([1.2, -0.6, -2.0]), atol=1e-12)
+            np.testing.assert_allclose(state_end.velocity, np.zeros(3), atol=1e-12)
     def test_circle_approximates_analytic_geometry_and_preserves_heading(self):
         origin = np.array([1., -2., -3.])
         trajectory = Trajectory('circle', origin=origin, yaw=1.67, radius=.6, speed=.25)
@@ -102,7 +130,7 @@ class PolynomialTrajectoryTests(unittest.TestCase):
         np.testing.assert_allclose(sample.body_rates, .5*np.array([w[2, 1]-w[1, 2], w[0, 2]-w[2, 0], w[1, 0]-w[0, 1]]), atol=1e-8)
 
     def test_knots_and_overlapping_windows_are_c3_and_time_continuous(self):
-        for mode in ['constant_velocity', 'circle']:
+        for mode in ['constant_velocity', 'circle', 'hover_to_hover']:
             trajectory = Trajectory(mode, start_delay=2.173, ramp=2.837)
             previous = None
             for elapsed in [0., 2., 2.51, 3.01, 4.99, 5.51, 13.01, 16.01, 100.]:

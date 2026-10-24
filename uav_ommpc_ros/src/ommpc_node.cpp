@@ -184,8 +184,10 @@ private:
     if (!fresh(odometry_at_, odometry_timeout_, steady_now) ||
       !fresh(status_at_, status_timeout_, steady_now) || !status_healthy_ || !trajectory_ ||
       !fresh(reference_at_, reference_timeout_, steady_now)) return std::nullopt;
-    const auto now_elapsed = uav_ommpc_ros::reference_elapsed(ros_now_ns, reference_start_ns_);
-    const auto anchor_elapsed = uav_ommpc_ros::reference_elapsed(odometry_ros_ns_, reference_start_ns_);
+    const auto now_elapsed = uav_ommpc_ros::reference_elapsed(
+      ros_now_ns, reference_start_ns_, period_.count());
+    const auto anchor_elapsed = uav_ommpc_ros::reference_elapsed(
+      odometry_ros_ns_, reference_start_ns_, period_.count());
     if (!now_elapsed || !anchor_elapsed || odometry_ros_ns_ > ros_now_ns) return std::nullopt;
     dynamics::State state;
     dynamics::ControlInput input;

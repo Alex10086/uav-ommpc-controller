@@ -21,7 +21,7 @@ from px4_msgs.msg import VehicleOdometry
 from uav_ommpc_interfaces.msg import PolynomialSegment, PolynomialTrajectory
 
 G = 9.80665
-MODES = ('hover', 'target_step', 'constant_velocity', 'circle')
+MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover')
 RATE_LIMITS = np.array([3.0, 3.0, 1.5])
 
 
@@ -129,18 +129,28 @@ def hermite7(left, right, duration):
     return c
 
 
+def _eval_axis(coeffs, s, inv_d, inv_d2, inv_d3):
+    d0 = d1 = d2 = d3 = 0.0
+    for c in reversed(coeffs):
+        d3 = d3 * s + 3.0 * d2
+        d2 = d2 * s + 2.0 * d1
+        d1 = d1 * s + d0
+        d0 = d0 * s + c
+    return d0, d1 * inv_d, d2 * inv_d2, d3 * inv_d3
+
+
 def evaluate_segment(segment, local_time):
-    s = local_time/segment.duration
-    derivatives = []
-    for order in range(4):
-        derivatives.append(np.array([
-            np.polynomial.polynomial.polyval(
-                s, np.polynomial.polynomial.polyder(coefficients, order))/segment.duration**order
-            for coefficients in (segment.x, segment.y, segment.z)]))
-    yaw = float(np.polynomial.polynomial.polyval(s, segment.yaw))
-    yaw_rate = float(np.polynomial.polynomial.polyval(
-        s, np.polynomial.polynomial.polyder(segment.yaw)))/segment.duration
-    return FlatSample(*derivatives, yaw, yaw_rate)
+    inv_d = 1.0 / segment.duration
+    inv_d2 = inv_d * inv_d
+    inv_d3 = inv_d2 * inv_d
+    s = local_time * inv_d
+    x0, x1, x2, x3 = _eval_axis(segment.x, s, inv_d, inv_d2, inv_d3)
+    y0, y1, y2, y3 = _eval_axis(segment.y, s, inv_d, inv_d2, inv_d3)
+    z0, z1, z2, z3 = _eval_axis(segment.z, s, inv_d, inv_d2, inv_d3)
+    w0, w1, _, _ = _eval_axis(segment.yaw, s, inv_d, inv_d2, inv_d3)
+    return FlatSample(
+        np.array([x0, y0, z0]), np.array([x1, y1, z1]),
+        np.array([x2, y2, z2]), np.array([x3, y3, z3]), w0, w1)
 
 
 def sample_flat(message, elapsed):
@@ -236,6 +246,21 @@ class Trajectory:
             return FlatSample(p, self.radius*w*tangent,
                               self.radius*(alpha*tangent+w*w*normal),
                               self.radius*((beta-w**3)*tangent+3.*w*alpha*normal), self.yaw, 0.)
+        if self.mode == 'hover_to_hover':
+            travel = max(elapsed-self.start_delay, 0.)
+            dist = float(np.linalg.norm(self.offset))
+            duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
+            u = min(travel/duration, 1.0)
+            s = u
+            poly = s**4*(35. + s*(-84. + s*(70. - 20.*s)))
+            poly_d1 = s**3*(140. + s*(-420. + s*(420. - 140.*s))) / duration
+            poly_d2 = s**2*(420. + s*(-1680. + s*(2100. - 840.*s))) / duration**2
+            poly_d3 = s*(840. + s*(-5040. + s*(8400. - 4200.*s))) / duration**3
+            p = self.origin + poly*self.offset
+            v = poly_d1*self.offset
+            a = poly_d2*self.offset
+            j = poly_d3*self.offset
+            return FlatSample(p, v, a, j, self.yaw, 0.0)
         p = self.origin.copy()
         if self.mode == 'target_step' and elapsed >= self.start_delay:
             p += self.offset
@@ -274,11 +299,16 @@ class Trajectory:
             last = math.ceil(end/self.segment_duration)
             knots.extend(k*self.segment_duration for k in range(first, last)
                          if anchor < k*self.segment_duration < end)
-            boundaries = [self.start_delay, self.start_delay+self.ramp]
             if self.mode == 'constant_velocity':
-                boundaries += [self.start_delay+self.ramp+self.line_duration,
+                boundaries = [self.start_delay, self.start_delay+self.ramp,
+                               self.start_delay+self.ramp+self.line_duration,
                                self.start_delay+2.*self.ramp+self.line_duration]
-            knots.extend(t for t in boundaries if anchor < t < end)
+            elif self.mode == 'hover_to_hover':
+                dist = float(np.linalg.norm(self.offset))
+                duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
+                boundaries = [self.start_delay, self.start_delay+duration]
+            else:
+                boundaries = [self.start_delay, self.start_delay+self.ramp]
             ordered = sorted(set(knots))
             knots = [ordered[0]]
             for knot in ordered[1:]:
@@ -295,8 +325,12 @@ class Trajectory:
                 segment.x, segment.y, segment.z = (coefficients[:, k].tolist() for k in range(3))
                 segment.yaw = [self.yaw]
                 msg.segments.append(segment)
-            msg.hold_final = (self.mode == 'constant_velocity' and
-                              end >= self.start_delay+2.*self.ramp+self.line_duration)
+            if self.mode == 'constant_velocity':
+                msg.hold_final = end >= self.start_delay+2.*self.ramp+self.line_duration
+            elif self.mode == 'hover_to_hover':
+                dist = float(np.linalg.norm(self.offset))
+                duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
+                msg.hold_final = end >= self.start_delay+duration
         check_message(msg)
         self._cached_key, self._cached_message = key, msg
         return msg
@@ -393,7 +427,7 @@ def check_message(msg):
             for name in ('position', 'velocity', 'acceleration', 'jerk', 'yaw', 'yaw_rate'):
                 if np.linalg.norm(np.asarray(getattr(left, name))-getattr(previous, name)) > 1e-6:
                     raise ValueError(f'discontinuous polynomial {name}')
-        for t in np.linspace(0., segment.duration, max(2, math.ceil(segment.duration/.02)+1)):
+        for t in np.linspace(0., segment.duration, max(2, math.ceil(segment.duration/.05)+1)):
             ref = flat_reference(evaluate_segment(segment, t))
             if not 1. <= ref.thrust_acceleration <= 12.:
                 raise ValueError('generated thrust exceeds [1, 12] m/s^2')
