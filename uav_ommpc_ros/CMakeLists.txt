@@ -24,6 +24,7 @@ endif()
 ament_target_dependencies(ommpc_node rclcpp rcl_interfaces px4_msgs uav_ommpc_interfaces)
 target_link_libraries(ommpc_node uav_ommpc_controller::uav_ommpc_controller)
 install(TARGETS ommpc_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

@@ -221,8 +221,10 @@ private:
       return;
     }
     const auto finished = Clock::now();
+    // Crossing a sample boundary is normal for asynchronous planner/control
+    // timers. Bound solve latency, not its phase relative to the reference grid.
     if (finished - started > period_ ||
-      active_window(finished, get_clock()->now().nanoseconds()) != index)
+      !active_window(finished, get_clock()->now().nanoseconds()))
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Discarded late or expired OMMPC solution");
       return;

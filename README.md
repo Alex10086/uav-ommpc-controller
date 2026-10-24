@@ -427,7 +427,7 @@ The hover position/yaw are explicit application choices in the current local fra
 - Fresh valid odometry, fresh reference receipt and fresh healthy vehicle status are all required. Vehicle status must report rotary-wing operation, not a VTOL transition, no failsafe and no termination mode. A fresh invalid odometry packet invalidates the cached state rather than continuing on its old value.
 - A changed odometry `reset_counter` invalidates the cached reference. The planner must publish a new trajectory in the updated local frame; the node cannot determine whether the planner actually corrected its origin. A backward ROS clock jump also invalidates the reference.
 - Malformed replacement reference metadata invalidates the old plan. Invalid selected poses, inconsistent dynamics, out-of-bound feedforward or solver failure produce **no control message**. Normal periodic solves resume only when the selected inputs are usable; no zero-thrust or last-solution fallback is generated.
-- After solving, the node checks freshness/window selection again. A solve exceeding one timer period or crossing into a different reference window is discarded rather than publishing a late command.
+- After solving, the node checks freshness and remaining horizon coverage again. A solve exceeding one timer period, an expired input, clock rollback or exhausted reference is discarded. Merely crossing a reference sample boundary during a timely solve is allowed: asynchronous planner/control phases must not suppress otherwise valid commands.
 
 The node deliberately does **not** require armed/Offboard status: valid pre-Offboard inputs let the bridge prime its heartbeat. The unchanged bridge only forwards angular-rate setpoints while PX4 reports Offboard. Neither node requests arming or a flight mode.
 
@@ -590,6 +590,124 @@ cd ~/uav_control_ws
 colcon test --packages-select uav_ommpc_ros
 colcon test-result --verbose --test-result-base build/uav_ommpc_ros
 ```
+
+## Reference test publisher and OMMPC SITL experiments
+
+`tools/reference_test_publisher.py` publishes only `/uav/reference_trajectory` using the same message as an upper-level planner. It never arms, changes modes or publishes `/uav/control_input`.
+
+| Mode | Reference behavior |
+| --- | --- |
+| `hover` | Fixed NED position and measured/supplied yaw |
+| `target_step` | After `--start-delay`, switch the entire horizon to a displaced hover equilibrium; default offset `[0.6,0.3,0] m` |
+| `constant_velocity` | Smooth speed ramp, constant-speed straight segment, smooth braking, then endpoint hold |
+| `circle` | Smooth angular-speed ramp, then a horizontal circle at fixed yaw |
+
+`polynomial` is intentionally **not a selectable mode**; it is deferred, not a no-op implementation.
+
+### Trajectory construction and publisher CLI
+
+The publisher generates uniformly sampled positions, computes `v_k=(p_{k+1}-p_k)/dt` and `a_k=(v_{k+1}-v_k)/dt`, aligns body Z with `g*e3-a_k`, then derives thrust magnitude and `omega_k=Log(R_k.transpose()*R_{k+1})/dt`. Quaternions use wxyz double precision, so every published horizon satisfies the existing nonlinear discrete model. It refuses feedforward outside thrust `[1,12] m/s²` or rate `±[3,3,1.5] rad/s`, instead of clipping and breaking reference consistency.
+
+The target step is a change of **desired equilibrium between messages**, not a state teleport inside one horizon. Its instantaneous reference error is expected in the step-test metrics. The trajectory before/after the step is dynamically consistent in each message.
+
+Line/circle speed ramps integrate a quintic smootherstep. For the line, `--line-duration` is the constant-speed duration; terminal displacement is `normalize(direction)*speed*(line_duration+ramp)` and motion finishes at `start_delay+line_duration+2*ramp`. Defaults give a 3.3 m North displacement, peak reference speed 0.3 m/s, and 16 s until endpoint hold. Circle starts at the origin with tangent North; its center is `origin+[0,radius,0]`, and `p=origin+radius*[sin(theta),1-cos(theta),0]`. Yaw remains fixed, not tangent-facing.
+
+```bash
+source ~/ros2-px4-env.bash
+source ~/uav_control_ws/install/setup.bash
+cd ~/uav_control_ws/src/uav-ommpc-controller
+
+# Offline feasibility checks; they do not publish or control a vehicle.
+python3 tools/reference_test_publisher.py --mode hover --check
+python3 tools/reference_test_publisher.py --mode target_step --check
+python3 tools/reference_test_publisher.py --mode constant_velocity --check
+python3 tools/reference_test_publisher.py --mode circle --speed 0.25 --check
+python3 -m unittest discover -s tools -p test_reference_test_publisher.py -v
+
+# Reference-only publishing; waits for valid odometry to capture unspecified origin/yaw.
+python3 tools/reference_test_publisher.py --mode hover
+python3 tools/reference_test_publisher.py --mode target_step --offset 0.6 0.3 0
+python3 tools/reference_test_publisher.py --mode constant_velocity --speed 0.3 --direction 1 0 0
+python3 tools/reference_test_publisher.py --mode circle --radius 0.6 --speed 0.25
+```
+
+Run only **one reference publisher** at a time. `--origin N E D` and `--yaw RAD` explicitly override captured odometry values; default yaw preserves the current heading. Defaults are `dt=0.02`, `samples=60` input samples plus 61 states, and `rate=25 Hz`. `samples` must cover the node's actual horizon. `--duration SECONDS` stops publishing after a bounded interval; it **does not land**. Stopping or Ctrl-C eventually triggers the existing controller/bridge timeouts, not a controlled recovery. A generation error stops publishing with a clear error/nonzero exit.
+
+ROS time is used consistently for the horizon stamp/trajectory phase. A new message is stamped at its first sample, not at the original trajectory start. The reference-only publisher does not monitor flight status or provide a flight safety state machine.
+
+### SITL-specific tuning and time-boundary correction
+
+**Do not use the ideal-model benchmark defaults as validated flight tuning.** The first real Gazebo/PX4 hover attempt (`hover-01`) hit the unchanged 0.6 rad tilt-abort threshold during takeoff, then landed and disarmed through native PX4 NAV_LAND. The failed result, CSV and bag were preserved.
+
+The separately installed `uav_ommpc_ros/config/ommpc_sitl.yaml` lowers feedback bandwidth for the simulated PX4 inner loop, without changing the controller library defaults:
+
+- `horizon=30`, `dt=0.02` (0.6 s window).
+- State weights `[30,30,60,20,20,30,80,80,40]`, terminal weights twice those values.
+- Input weights `[4,20,20,5]`; original thrust/rate bounds unchanged.
+- Bridge calibration remains `hover_thrust=0.728744`, `max_throttle=0.9`.
+
+For context, the hover horizontal finite-horizon position/rate feedback gain drops from approximately 20.86 to 0.287 rad/s per metre, while attitude damping remains approximately 4.28 rad/s per radian. This is a conservative low-speed test configuration, not a high-speed or real-hardware qualification.
+
+A later attempt (`tracking-01`) was correctly blocked **before arming** because the node discarded timely solutions whenever solve execution crossed a reference sample boundary. That made output depend on timer phase. `ommpc_node.cpp` now retains the solve-period/freshness/full-horizon checks without requiring an unchanged sample index. A disarmed regression swept reference timestamp offsets 0,3,6,9,12,15,18 ms: each 0.6 s observation produced 30–31 commands, maximum gap below 0.029 s. These changes do not suppress the warning or bypass a timeout; they correct the overly strict phase condition.
+
+### Reproduce the actual flight tests
+
+Start the existing DDS Agent, headless `gz_x500`, GCS heartbeat and calibrated bridge using the prerequisites in the next section. Do not start the old `sitl_flight_test.py` PD controller concurrently. In a separate sourced ROS terminal:
+
+```bash
+ros2 run uav_ommpc_ros ommpc_node --ros-args --params-file \
+  "$(ros2 pkg prefix uav_ommpc_ros)/share/uav_ommpc_ros/config/ommpc_sitl.yaml"
+```
+
+Then run the flight utility instead of a separate reference publisher:
+
+```bash
+cd ~/uav_control_ws/src/uav-ommpc-controller
+
+# Incremental hover first, then the remaining three phases.
+python3 tools/sitl_ommpc_test.py --confirm-sitl --modes hover --record-bag \
+  --output-dir ~/uav_control_ws/ommpc-flight-results/NEW_HOVER_RUN
+python3 tools/sitl_ommpc_test.py --confirm-sitl \
+  --modes target_step constant_velocity circle --record-bag \
+  --output-dir ~/uav_control_ws/ommpc-flight-results/NEW_TRACKING_RUN
+
+# Alternatively run all four phases in one flight:
+python3 tools/sitl_ommpc_test.py --confirm-sitl --record-bag
+```
+
+`--confirm-sitl` is a mandatory operator assertion: DDS message types cannot prove hardware identity. The operator must ensure this ROS domain reaches only the intended simulator. The utility refuses an initially armed/moving/non-landed vehicle and requires advancing raw `/fmu` and bridged telemetry. It prestreams references, requests Offboard/arm with matching accepted acknowledgements and observed status, ramps the hover target to 2 m, runs each phase, then requests native NAV_LAND and waits for fresh land detection plus disarmed status. It never publishes a PD control command, force-arms or disables preflight/failsafe parameters.
+
+Safety/acceptance checks remain explicit: fresh odometry <=0.2 s and status <=1.5 s; active control/rate gap <=0.3 s; abort above 2 m tracking error or 0.6 rad tilt. Each endpoint must hold for >=5 s within 0.35 m position error, 0.3 m/s speed, 0.25 rad tilt and 0.2 rad yaw error. Line/circle phase RMSE must be <=0.35 m position and <=0.3 m/s velocity; every trajectory phase maximum position error must be <=1 m. Accepted OMMPC input tolerance is 1e-4 in corresponding input units, matching the solver contract.
+
+### Metrics and recordings
+
+The runner writes `result.json`, aggregate `trace.csv`, each phase's JSON/CSV, complete published horizon samples in `reference.csv`, actual OMMPC commands in `control_input.csv`, and PX4-facing outputs in `bridge_rates.csv`. Position/velocity errors use the current time-selected reference sample (floor indexing), not a future horizon endpoint. Metrics include phase RMSE/max error, observed speed/tilt/yaw, command gaps, bound violations, fresh telemetry counts, ACKs and final landing state. Missing values are recorded as null rather than fabricated zeros.
+
+`--record-bag` records 13 reference/telemetry/control/command/acknowledgement topics into `bag/` and closes the recorder via SIGINT with bounded cleanup. Check `rosbag.log` and `ros2 bag info RUN_DIR/bag`. Bags include command topics: **never replay them into a live aircraft or an active control domain**. Analyze offline or use an isolated domain and explicit non-command topic selection.
+
+The current node does not publish per-solve iteration/latency diagnostics. Stable solving is evidenced here by actual continuous OMMPC output, gap metrics and retained node logs; these are not fabricated per-QP timing or failure counters.
+
+### Observed PX4/Gazebo results
+
+Successful evidence directories on Jetson:
+
+- `~/uav_control_ws/ommpc-flight-results/hover-02`
+- `~/uav_control_ws/ommpc-flight-results/tracking-02`
+
+Both runs report `passed=true`, accepted Offboard/arm/land transitions, and confirmed native landing plus disarm. The following are **entire named-phase** metrics; line/circle include ramping and final endpoint settling, while step includes its deliberate target jump.
+
+| Phase | Position RMSE (m) | Maximum error (m) | Velocity RMSE (m/s) | Maximum tilt (rad) | Maximum control gap (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hover, >=5 s stable | 0.06052 | 0.07557 | 0.01574 | 0.00323 | 0.02806 |
+| Target step, `[0.6,0.3,0] m` | 0.30681 | 0.66193 | 0.08321 | 0.03859 | 0.03320 |
+| Straight line, 0.3 m/s | 0.05482 | 0.09127 | 0.01438 | 0.01820 | 0.04026 |
+| Circle, radius 0.6 m / 0.25 m/s | 0.04470 | 0.10144 | 0.03193 | 0.04728 | 0.06647 |
+
+Every phase observed zero input-bound violations and zero control gaps above 0.1 s. Maximum observed model-estimated speeds were 0.3112 m/s on the straight line and 0.2537 m/s on the circle. The circle phase covered more than one revolution after its smooth start. Controller logs show no solver-failure warnings during the successful tracking sequence; one estimator-reset event during takeoff paused control until the next reference, as designed.
+
+Both successful MCAP bags were inspected: hover 4.3 MiB / 9,120 messages; tracking 15.6 MiB / 29,429 messages. Node logs are copied into the corresponding experiment directories. Failed attempts `hover-01` and `tracking-01` are retained, not overwritten. An independent six-test trajectory suite passed, including yaw near pi, step-equilibrium semantics, line terminal hold, circle geometry, nonlinear discrete consistency and infeasible-feedforward rejection. The existing colcon suite still reports 61 tests with no failures after the node timing correction.
+
+These are actual simulated PX4/Gazebo flights through the OMMPC ROS node, **not** merely matched-model closed-loop examples. They establish low-speed SITL behavior only; actuator-model mismatch, estimation, inner-loop delay and hardware safety require separate real-aircraft validation.
 
 ## SITL flight test
 
