@@ -1,13 +1,13 @@
-# UAV OMMPC mathematics and ROS 2 / PX4 bridge
+# UAV OMMPC controller and ROS 2 / PX4 bridge
 
-Minimal ROS 2 Jazzy **C++17 / rclcpp** communication packages for PX4 v1.17. This repository does **not** implement the user's OMMPC algorithm. An external controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs. The Python bridge has been removed; `ros2 run uav_ommpc_ros px4_bridge` and all public topics, messages, QoS and startup parameters remain unchanged. Only the SITL test utilities use Python.
+ROS 2 Jazzy **C++17 / rclcpp** communication packages for PX4 v1.17. A separate controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs. The Python bridge has been removed; `ros2 run uav_ommpc_ros px4_bridge` and all public topics, messages, QoS and startup parameters remain unchanged. Only the SITL test utilities use Python.
 
-`uav_ommpc_controller` supplies standalone C++17/Eigen mathematical primitives and nonlinear single-step quadrotor prediction. It does not yet supply an MPC optimizer or flight controller, and is not connected to the bridge.
+`uav_ommpc_controller` supplies standalone C++17/Eigen mathematical primitives, nonlinear single-step prediction, discrete local-error linearization and a condensed OMMPC optimizer using OSQP. The optimizer is a library, **not wired to ROS/PX4**; its included tracking executable exercises only the nonlinear mathematical model.
 
 ## OMMPC mathematics (no ROS dependency)
 
 Header: `uav_ommpc_controller/include/uav_ommpc_controller/so3_math.hpp`.
-All functions are inline, use fixed-size `Eigen::Vector3d` / `Eigen::Matrix3d`, and operate in double precision. Eigen is the only library dependency; GoogleTest is required only when building tests.
+These mathematical functions are inline, use fixed-size `Eigen::Vector3d` / `Eigen::Matrix3d`, and operate in double precision. The mathematical headers require only Eigen; the compiled MPC library additionally embeds OSQP. GoogleTest is required only when building tests.
 
 ### Definitions and conventions
 
@@ -58,7 +58,7 @@ const Eigen::Matrix3d R_next = so3::boxplus(R, omega_body * 0.01);
 
 ### Build and test
 
-Standalone, without sourcing ROS (Ubuntu development packages: `libeigen3-dev`, `libgtest-dev`):
+Standalone, without sourcing ROS (requires a C/C++ toolchain, CMake, Git, `libeigen3-dev`, and `libgtest-dev` for tests). The first configure fetches pinned OSQP/QDLDL sources into the build directory; no system-wide solver installation or sudo is needed:
 
 ```bash
 cd ~/uav_control_ws
@@ -85,6 +85,10 @@ An independent CMake consumer can set `CMAKE_PREFIX_PATH` to
 find_package(uav_ommpc_controller CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE uav_ommpc_controller::uav_ommpc_controller)
 ```
+
+The exported target now links the compiled `libuav_ommpc_controller.so`; mathematical headers remain usable without linking it if only their inline functions are needed. OSQP is linked statically inside that shared library, so consumers do not need OSQP headers or a separate OSQP package. Solver/ordering license notices install under `share/uav_ommpc_controller/licenses`.
+
+`cmake/FetchOsqp.cmake` pins OSQP 0.6.3 commit `0dd00a578cf1c2691c5c379965d504c75bf6cfad` and its QDLDL submodule (`7d16b70a10a152682204d745d814b6eb63dc5cd2`). For offline builds or reuse between standalone/colcon builds, pass `-DFETCHCONTENT_SOURCE_DIR_OSQP=/absolute/path/to/that/osqp/source` with its submodule populated. The current Jetson colcon build reuses `~/uav_control_ws/so3-math-build/_deps/osqp-src`. OSQP/QDLDL emit upstream CMake minimum-version deprecation warnings; these do not prevent the observed builds and are not suppressed.
 
 On Jetson, all 13 SO(3)/R³ tests passed in both standalone Release and colcon builds. Coverage includes hat/vee and cross products, Euclidean errors, right-handed quarter turns, zero/tiny rotations, the Taylor-branch boundary, pi and both sides of its branch cut, 500 seeded rotation round trips, right-local error direction, finite-difference Jacobians, vector-action derivatives, and 10,000 consecutive body-rate updates.
 
@@ -147,7 +151,7 @@ The equations follow the author [preprint](https://arxiv.org/html/2106.15233v1),
 
 ### Verification
 
-The build/test commands above now run **21 tests: 13 mathematical tests and 8 dynamics tests**, all passing on Jetson in standalone Release and colcon builds. Dynamics tests cover zero time, hover at different yaw angles, free fall, excess thrust, tilted thrust evaluated at the current attitude, right-multiplied body-rate rotation with time scaling, supplied gravity, and 1,000 chained steps checked against discrete ballistics and closed-form attitude.
+All 8 dynamics tests pass on Jetson in standalone Release and colcon builds. They cover zero time, hover at different yaw angles, free fall, excess thrust, tilted thrust evaluated at the current attitude, right-multiplied body-rate rotation with time scaling, supplied gravity, and 1,000 chained steps checked against discrete ballistics and closed-form attitude.
 
 For dynamics tests alone:
 
@@ -156,6 +160,207 @@ ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Dynamics\.' --output-on-fa
 ```
 
 An independent program compiled directly against the installed header without sourcing ROS, with Eigen heap allocation disabled and assertions enabled. Across 1,000 steps of 2 ms, yawing hover had zero position/velocity drift and a rotation-matrix error of `1.48e-14`. A tilted, constant-thrust trajectory matched its discrete closed-form solution with position error `6.31e-14 m` and velocity error `1.21e-13 m/s`. This verifies the mathematical predictor, not physical flight or PX4 integration. The temporary program was removed after verification.
+
+## Discrete local-error linearization
+
+Header: `uav_ommpc_controller/include/uav_ommpc_controller/linearization.hpp`.
+Namespace: `uav_ommpc_controller::linearization`. The implementation is header-only, uses fixed-size double-precision Eigen matrices, and reuses `dynamic.hpp` and `so3_math.hpp`.
+
+### Error coordinates and API
+
+The 9-dimensional `StateError` is ordered as
+`[delta_p_world(3), delta_v_world(3), delta_theta_local(3)]`, where
+`delta_theta_local = Log(R_ref.transpose() * R)`. The 4-dimensional `InputError` is
+`[delta_thrust_acceleration, delta_omega_body(3)]`. Both errors are **actual minus reference**. Rotation errors are in radians, not Euler-angle differences or nine flattened rotation-matrix entries. Position/velocity errors are in metres and m/s.
+
+| API | Purpose |
+| --- | --- |
+| `state_error(actual, reference)` | Extract the compound R³ × R³ × SO(3) local state error |
+| `apply_state_error(reference, error)` | Reconstruct a state with `p_ref + dp`, `v_ref + dv`, `R_ref * Exp(dtheta)` |
+| `linearize(reference, reference_input, dt)` | Return `LinearModel` containing `A` (9×9) and `B` (9×4) |
+| `model.predict(delta_x, delta_u)` | Compute `delta_x_next = A * delta_x + B * delta_u` |
+
+The next error is measured about **the propagated reference**
+`reference_next = dynamics::predict_step(reference, reference_input, dt)`, not the old reference. Consequently, reconstruction must use `apply_state_error(reference_next, delta_x_next)`. The same gravity value must be used for reference and actual nonlinear propagation; its additive acceleration cancels from the Jacobians, so `linearize` needs no gravity argument.
+
+### Discrete Jacobians
+
+Let `R`, `a_T` and `omega` denote the reference attitude and input, `h = dt`,
+`e3 = [0, 0, 1]ᵀ` and `phi = h * omega`. The matrices are:
+
+```text
+    [ I   h*I   0                  ]        [ 0          0          ]
+A = [ 0   I     h*a_T*R*hat(e3)     ],   B = [ -h*R*e3    0          ]
+    [ 0   0     Exp(-phi)          ]        [ 0          h*J_r(phi) ]
+```
+
+All unshown blocks are zero. `J_r(phi) = J_l(phi).transpose()` uses the existing SO(3) right Jacobian. The orientation block `Exp(-phi)` transports the current right-local attitude error into the next reference's local coordinates. The signs in the velocity blocks follow `v_dot = g - a_T * R * e3`, consistent with the project's NED/FRD convention.
+
+These are analytic derivatives of the **implemented discrete** nonlinear step, not the approximation `A = I + h*A_continuous` for every block. In particular, the attitude blocks retain the exponential and right Jacobian at nonzero angular rates. Position has no same-step input/attitude coupling because `dynamic.hpp` uses `p_next = p + h*v`; gravity and the reference position/velocity do not affect the Jacobians.
+
+The approximation is
+`delta_x_next = A*delta_x + B*delta_u + O(||[delta_x, delta_u]||²)`
+locally about zero error. There is no affine reference defect: this API assumes the next reference is generated by the same nonlinear step. An arbitrary externally supplied next reference that violates that dynamics is not supported by simply changing the reconstruction reference; the error chart and linearization would need to be reconsidered. For a time-varying trajectory, recompute the model at each reference state/input and propagate errors between those successive reference charts.
+
+### Usage
+
+```cpp
+#include <uav_ommpc_controller/linearization.hpp>
+
+namespace dyn = uav_ommpc_controller::dynamics;
+namespace lin = uav_ommpc_controller::linearization;
+const double dt = 0.01;
+
+// actual/reference are dyn::State; input/reference_input are dyn::ControlInput.
+const auto model = lin::linearize(reference, reference_input, dt);
+const lin::StateError dx = lin::state_error(actual, reference);
+lin::InputError du;
+du << input.thrust_acceleration - reference_input.thrust_acceleration,
+  input.body_rates - reference_input.body_rates;
+
+const lin::StateError dx_next = model.predict(dx, du);
+const auto reference_next = dyn::predict_step(reference, reference_input, dt);
+const dyn::State predicted_next = lin::apply_state_error(reference_next, dx_next);
+```
+
+The same finite-input, valid-SO(3), nonnegative-time and physical-input preconditions as `dynamic.hpp` apply; no validation, clamping or matrix repair is performed. Error perturbations must be small, and the principal attitude chart must stay away from its pi branch cut. Nominal orientation need not be near identity: large absolute attitudes are valid. `apply_state_error` preserves the rotation-manifold structure but does not turn the first-order model into an exact nonlinear predictor.
+
+### Sources and verification
+
+The author [preprint](https://arxiv.org/html/2106.15233v1) defines actual-minus-reference errors in (17)–(18), the discrete error linearization in (20)–(23), manifold transport in Table I, and quadrotor derivatives in (34). Equation numbers here refer to the preprint, not verified journal-version numbering. The reference repository's [`setStateMatricesAndBounds`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/src/controller_core.cpp) supplies the same block structure and `J_l(phi).transpose()` rotation-input block; its body +Z thrust signs are not copied into this NED/FRD model.
+
+All 8 linearization tests pass on Jetson in standalone Release and colcon builds. They check chart packing/reconstruction, zero time, hover tilt/thrust signs, transport to the next tangent frame, all columns of the 9×9 and 9×4 Jacobians against nonlinear central differences, zero-thrust boundary behavior, second-order joint-perturbation residuals, and 20 chained models along a moving reference. Central differences include zero/tiny rates, both sides of the SO(3) Taylor threshold, a step rotation near pi, a nominal attitude near pi, and different common gravity values; maximum-entry discrepancies are below `3e-9`.
+
+```bash
+ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Linearization\.' --output-on-failure
+```
+
+An independent program compiled against the installed header without sourcing ROS, with Eigen heap allocation disabled and assertions enabled. It reconstructed full predicted states and compared them with nonlinear steps at joint-perturbation scales `0.02`, `0.01`, `0.005`. Velocity residuals were `5.4873e-5`, `1.3715e-5`, `3.4285e-6` m/s, and attitude residuals were `2.3841e-6`, `5.9603e-7`, `1.4901e-7` rad: each halving reduced these residuals by approximately four. Position errors were below `6.3e-16 m`; reconstructed-rotation orthogonality errors were below `4.7e-16`. The temporary consumer was removed afterward. This is mathematical-model verification, not flight or MPC-solver validation.
+
+## Condensed on-manifold MPC
+
+Implementation: `uav_ommpc_controller/src/ommpc.cpp`; API: `include/uav_ommpc_controller/ommpc.hpp`.
+Namespace: `uav_ommpc_controller::ommpc`. `Controller` owns one persistent OSQP workspace and fixed-horizon buffers. Construct it once per control loop; it is noncopyable and not thread-safe. Settings are copied at construction, not changed mid-solve.
+
+### Reference and error contract
+
+`solve(actual, reference, feedforward)` takes one measured/predicted `dynamics::State`, **N+1 reference states** (`x_ref,0` through `x_ref,N`) and **N feedforward inputs** (`u_ref,0` through `u_ref,N-1`), all at `Settings::dt`.
+
+- Frames, units, right-local attitude error and actual-minus-reference signs match the earlier modules.
+- Each reference transition must satisfy `dynamic.hpp` with the configured gravity. Position, velocity and rotation-vector defect norms must each be at most `1e-6`. Reference inputs must lie inside the configured box.
+- The controller rejects mismatched dimensions, nonfinite data, invalid rotation matrices, out-of-box references and dynamically inconsistent reference transitions. It does not silently regenerate or repair the trajectory.
+- A position-only trajectory is not a complete reference: velocity, attitude, thrust acceleration and body rates are required. `examples/ommpc_tracking.cpp` demonstrates constructing them consistently using forward position/velocity differences, `R*e3 = (g-a)/||g-a||`, `a_T = ||g-a||`, and `omega = Log(R_k.transpose()*R_{k+1})/dt`.
+
+As with `linearization.hpp`, this is a local one-linearization-per-cycle MPC. Small tracking errors and dynamically feasible references are assumed; no nonlinear SQP iterations or affine trajectory-defect model are added.
+
+### Condensation and QP
+
+From each reference state/input, obtain `A_k, B_k` using `linearization::linearize`. Stack
+`delta_X = [delta_x1; ...; delta_xN]` and `delta_U = [delta_u0; ...; delta_uN-1]`.
+The recursive coefficients are:
+
+```text
+H_0 = A_0                         M_0,0 = B_0
+H_k = A_k * H_{k-1}               M_k,j = A_k * M_{k-1,j}   (j < k)
+                                  M_k,k = B_k               (j > k: zero)
+delta_X = H * delta_x0 + M * delta_U
+```
+
+The stage cost penalizes state errors `x1..xN-1`, terminal error `xN`, and input errors `u0..uN-1`. The cost of the fixed initial state `x0` is constant and omitted:
+
+```text
+Qbar = diag(Q, ..., Q, Q_terminal)     Rbar = diag(R, ..., R)
+P = 2 * (M.transpose() * Qbar * M + Rbar)
+q = 2 * M.transpose() * Qbar * H * delta_x0
+
+minimize  0.5 * delta_U.transpose() * P * delta_U + q.transpose() * delta_U
+subject to  u_min - u_ref,k <= delta_u_k <= u_max - u_ref,k,  k = 0..N-1
+```
+
+Only **4N decision variables** remain; state equalities are eliminated rather than passed to OSQP. Positive input weights keep the Hessian positive definite even if state weights are zero. `problem()` exposes `M`, `H`, `P`, `q`, `lower`, `upper` for inspection after a successful solve. `input_errors()` and `predicted_errors()` expose the optimized stacked errors, owned by the controller and overwritten by the next call.
+
+OSQP 0.6.3 receives the fixed upper-triangular Hessian sparsity pattern and identity constraint matrix. Every cycle updates numerical coefficients, gradient and bounds without recreating the workspace. Warm starts shift the previous **absolute** input sequence, then subtract the new feedforward and project only the initial guess into the new box; stale input-error coordinates are not reused. Dual guesses start at zero. The returned solution is not clipped.
+
+For Hessian construction, symmetric column inner products skip structurally zero causal prefixes. This avoids the temporary heap scratch space observed in Eigen's general matrix-multiply path. The matrix/vector storage is allocated once at construction; a runtime Eigen-allocation guard passed complete solves at horizons 1, 20 and 100. Polishing is disabled to avoid its additional factorization/allocations. This is not a hard-real-time proof or an instrumentation of every allocator inside the external solver.
+
+### Initial tuning and constraints
+
+| Setting | Default |
+| --- | --- |
+| Horizon / step | `N=20`, `dt=0.02 s` (0.4 s prediction window, intended 50 Hz control) |
+| Position weights, N/E/D | `[1000, 1000, 800]` |
+| Velocity weights | `[20, 20, 20]` |
+| Local attitude weights | `[40, 40, 40]` |
+| Terminal state weights | `2 *` the default state-weight vector |
+| Input-error weights, thrust / body rates | `[0.5, 1.2, 1.2, 0.6]` |
+| Total thrust acceleration | `[1, 12] m/s²` |
+| Body angular rates | `±[3, 3, 1.5] rad/s` |
+| OSQP iteration limit | `400` |
+| OSQP absolute / relative tolerances | `1e-5 / 1e-5` |
+| Maximum accepted input-bound violation | `1e-4` in the corresponding input units |
+
+State/input weights start from the reference repository's 20-step tuning, with a doubled terminal penalty and no horizon discount. The terminal vector is an independent settings field: modifying `state_weights` later does not automatically change `terminal_weights`; set both when retuning. Supported horizons are 1–100, and positive finite `dt`/gravity and positive finite input weights are required. Invalid settings throw `std::invalid_argument`; OSQP setup failure throws `std::runtime_error`.
+
+The rate bounds match the bridge defaults. The thrust ceiling is deliberately below the bridge's approximate `9.80665 * 0.9 / 0.728744 ≈ 12.11 m/s²` input ceiling for the previously calibrated x500, not the reference implementation's `30 m/s²`. **These are initial model/controller settings, not validated aircraft operating limits.** Changing vehicle calibration, bridge limits or timing requires consistent retuning. Faster trajectories must remain dynamically feasible under these bounds; raising limits is not a substitute for available vehicle thrust or bandwidth.
+
+There are no position, obstacle, tilt, velocity or input-slew constraints; no disturbance estimator, rotor drag or motor/rate-loop lag. The cost does not by itself enforce those omitted physical constraints.
+
+### Result and usage
+
+Only `OSQP_SOLVED`, finite outputs, and original-box violations no greater than `1e-4` yield `Status::Solved` and a populated `Result::command`. `OSQP_SOLVED_INACCURATE`, iteration limits and update/solve failures are rejected. `Result` also provides the native solver status, iterations and measured bound violation.
+
+On any rejected call, `command` is empty, both solution vectors become NaN, and the previous warm start is invalidated. There is **no stale command, zero-thrust fallback, retry or automatic flight action**. The caller must handle failure and telemetry validity. `problem()` is only valid for inspection after a successful call.
+
+```cpp
+#include <uav_ommpc_controller/ommpc.hpp>
+
+namespace mpc = uav_ommpc_controller::ommpc;
+mpc::Settings settings;
+mpc::Controller controller(settings);  // Outside the repeated control loop.
+
+// actual: dynamics::State
+// reference: std::vector<dynamics::State>, size settings.horizon + 1
+// feedforward: std::vector<dynamics::ControlInput>, size settings.horizon
+const auto result = controller.solve(actual, reference, feedforward);
+if (result.command)
+{
+  const auto &u = *result.command;  // u_ref,0 + optimized delta_u0
+  // u.thrust_acceleration [m/s²], u.body_rates [rad/s, body FRD].
+  // This library does not publish them to PX4.
+}
+// Empty command: application-specific safety handling is required.
+```
+
+### Verification and reproducible tracking example
+
+All **39 tests** passed in standalone Release and colcon builds: the earlier 29 math/model tests plus 10 MPC tests. MPC coverage includes every condensed prediction column versus recursive time-varying propagation, Hessian/gradient/terminal indexing and factor-of-two conventions versus recursive cost, comparison to an unconstrained LDLT optimum, hover feedforward, active input bounds, changing-reference workspace reuse, invalid input/reference rejection and clearing stale solutions, and forced one-iteration solver failure.
+
+```bash
+ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Ommpc\.' --output-on-failure
+~/uav_control_ws/install/uav_ommpc_controller/bin/ommpc_tracking
+# Or use ~/uav_control_ws/so3-math-build/ommpc_tracking.
+# Disable building this example with -DBUILD_EXAMPLES=OFF.
+```
+
+`ommpc_tracking` simulates a 12-second, 5 m radius circle at analytic speed 5 m/s and fixed 2 m altitude/yaw. It uses the **nonlinear** `dynamic.hpp` plant, exact discrete reference transitions, initial position error `[0.2, -0.15, 0.1] m`, and nonzero velocity/attitude errors. It stops on solver failure, invalid output or bound violation and returns failure if post-2-second position RMSE exceeds 0.15 m. Latency is measured over complete `Controller::solve` calls (including validation, linearization, condensation, QP updates and solve), not OSQP iterations alone. It reports 20 ms deadline misses but does not run as a paced real-time process.
+
+Observed final installed Release executable on Jetson:
+
+| Measurement | Result |
+| --- | ---: |
+| Completed solve calls / failures | 600 / 0 |
+| Position RMSE, entire run | 0.049724555 m |
+| Position RMSE, after 2 s | 0.000006082 m |
+| Maximum position error, entire run | 0.277367370 m |
+| Maximum position error, after 2 s | 0.000059362 m |
+| Peak model speed | 5.525948859 m/s |
+| Maximum input-bound violation | 0.000006914 |
+| Solve-call median / p95 / maximum | 0.820637 / 1.144456 / 2.331090 ms |
+| Solve calls above 20 ms | 0 |
+
+The near-zero steady-state error is a **matched-model, disturbance-free simulation result**, not a claim of micrometre flight accuracy. No ROS/PX4/SITL or real aircraft was exercised by this example. An independent CMake consumer also linked the installed exported target without ROS and obtained correctly directed corrective thrust/rates.
+
+The condensed formulation follows the author [preprint](https://arxiv.org/html/2106.15233v1), Section V-C, equations (25)–(30), using the existing actual-minus-reference error convention. The reference repository's [`mpc_wrapper.hpp`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/include/ommpc_core/mpc_wrapper.hpp) uses an uncondensed sparse QP; this implementation intentionally follows the paper's **condensed** form and reuses its OSQP API rather than copying the per-cycle setup/cleanup pattern. Baseline weights come from [`params.yaml`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_ros/config/params.yaml).
 
 ## Build and environment
 
