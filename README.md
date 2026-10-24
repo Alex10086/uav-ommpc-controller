@@ -2,7 +2,7 @@
 
 Minimal ROS 2 Jazzy **C++17 / rclcpp** communication packages for PX4 v1.17. This repository does **not** implement the user's OMMPC algorithm. An external controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs. The Python bridge has been removed; `ros2 run uav_ommpc_ros px4_bridge` and all public topics, messages, QoS and startup parameters remain unchanged. Only the SITL test utilities use Python.
 
-`uav_ommpc_controller` supplies the standalone C++17/Eigen mathematical primitives described below. It does not yet supply an MPC optimizer or flight controller, and is not connected to the bridge.
+`uav_ommpc_controller` supplies standalone C++17/Eigen mathematical primitives and nonlinear single-step quadrotor prediction. It does not yet supply an MPC optimizer or flight controller, and is not connected to the bridge.
 
 ## OMMPC mathematics (no ROS dependency)
 
@@ -86,7 +86,7 @@ find_package(uav_ommpc_controller CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE uav_ommpc_controller::uav_ommpc_controller)
 ```
 
-On Jetson, all 13 tests passed in both standalone Release and colcon builds. Coverage includes hat/vee and cross products, Euclidean errors, right-handed quarter turns, zero/tiny rotations, the Taylor-branch boundary, pi and both sides of its branch cut, 500 seeded rotation round trips, right-local error direction, finite-difference Jacobians, vector-action derivatives, and 10,000 consecutive body-rate updates.
+On Jetson, all 13 SO(3)/R³ tests passed in both standalone Release and colcon builds. Coverage includes hat/vee and cross products, Euclidean errors, right-handed quarter turns, zero/tiny rotations, the Taylor-branch boundary, pi and both sides of its branch cut, 500 seeded rotation round trips, right-local error direction, finite-difference Jacobians, vector-action derivatives, and 10,000 consecutive body-rate updates.
 
 An independent Release-mode CMake consumer also built against the installed package without sourcing ROS. With Eigen heap allocation disabled and assertions enabled, it recovered `[0.001, -0.002, 0.003]` rad with error `2.76e-17`; 1,000 body-rate updates differed from the closed-form rotation by `6.72e-14` in matrix Frobenius norm. The temporary consumer was removed after verification.
 
@@ -95,6 +95,67 @@ An independent Release-mode CMake consumer also built against the installed pack
 - G. Lu, W. Xu and F. Zhang, [On-Manifold Model Predictive Control for Trajectory Tracking on Robotic Systems](https://doi.org/10.1109/TIE.2022.3212397), IEEE TIE 70(9), 9192–9202, 2023.
 - The accessible author [preprint](https://arxiv.org/html/2106.15233v1), titled *Model Predictive Control for Trajectory Tracking on Differentiable Manifolds*: Section III-D defines Euclidean and Lie-group boxplus/boxminus; Section V defines actual-minus-reference error states. These section references are to the preprint, not verified journal-version equation numbers. Rodrigues' formula is written explicitly above with the quadratic term divided by `theta²`.
 - Engineering reference: [`refact-decouple/ommpc_core/include/ommpc_core/so3_math.h`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/include/ommpc_core/so3_math.h) and its [quadrotor derivation](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/OMMPC_derivation.pdf). This implementation uses the same hat/vee and left-Jacobian conventions, with explicit local-error operations and small-angle tests.
+
+## Nonlinear single-step dynamics
+
+Header: `uav_ommpc_controller/include/uav_ommpc_controller/dynamic.hpp`.
+Namespace: `uav_ommpc_controller::dynamics`. This is a header-only C++17/Eigen implementation using the existing `r3::boxplus` and `so3::boxplus`; no ROS dependency or dynamic-size matrices.
+
+### State, input and frames
+
+| Type / field | Meaning |
+| --- | --- |
+| `State::p` | World NED position, metres |
+| `State::v` | World NED velocity, m/s; not body-frame velocity |
+| `State::R` | Body FRD to world NED rotation matrix |
+| `ControlInput::thrust_acceleration` | Nonnegative total thrust divided by mass, m/s², acting along body −Z |
+| `ControlInput::body_rates` | Body FRD angular velocity `(wx, wy, wz)`, rad/s |
+| `predict_step(state, input, dt, gravity = kGravity)` | Returns the next `State`; `dt` is seconds, `gravity` is a positive scalar in m/s² |
+
+The state is `x = (p, v, R)` and the input is `u = (a_T, omega_body)`. Angular velocity is held as an input during a step: there is no prediction of `omega_next`, torque input or inertia model. If supplying measured angular velocity instead of a command, the same constant-rate assumption applies.
+
+Thrust is **not** a force in newtons or a normalized throttle. Given a force `T` and mass `m`, the caller supplies `a_T = T / m`. It includes the thrust needed to counter gravity; it is not net vertical acceleration. The default `kGravity = 9.80665` matches the existing bridge; pass `9.81` explicitly to use the preprint's gravity value.
+
+### Model and discretization
+
+With `e3 = [0, 0, 1]ᵀ` and gravity directed down in NED:
+
+```text
+a_k     = [0, 0, gravity]ᵀ - a_T * R_k * e3
+p_{k+1} = p_k + dt * v_k
+v_{k+1} = v_k + dt * a_k
+R_{k+1} = R_k * Exp(dt * omega_body)
+```
+
+Both translational updates use the **current** state. This is forward Euler on position/velocity combined with the SO(3) exponential for rotation, following the paper's canonical discrete model. Do not insert `0.5 * a * dt²`, use the updated velocity for position, or use the updated attitude for thrust acceleration without also changing the discretization and subsequent linearization. Rotation is exact for constant body rates over the step; translation remains first-order, not an exact continuous-time integration during changing attitude.
+
+Inputs must be finite, `R` must belong to SO(3), `dt >= 0`, `thrust_acceleration >= 0`, and `gravity > 0`. Validation belongs to the caller, consistent with `so3_math.hpp`; the function does not clamp inputs or repair matrices. It models no drag, wind, motor lag, saturation, body-rate tracking lag or rigid-body torque dynamics, and performs no ENU/FLU conversion.
+
+### Usage
+
+```cpp
+#include <uav_ommpc_controller/dynamic.hpp>
+
+namespace dynamics = uav_ommpc_controller::dynamics;
+const dynamics::State state{p, v, R};
+const dynamics::ControlInput input{thrust_acceleration, w_body};
+const dynamics::State next = dynamics::predict_step(state, input, 0.01);
+// next.p, next.v, next.R; w_body remains a held input, not a predicted state.
+```
+
+The equations follow the author [preprint](https://arxiv.org/html/2106.15233v1), Section IV-A and Section VII-A2/A3, equations (32)–(33) in that preprint, not verified journal-version numbering. The engineering reference is [`OMMPCControllerCore::setStateMatricesAndBounds`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/src/controller_core.cpp): its `dt * I` position/velocity block and `Exp(-omega * dt)` attitude-error block are consistent with this discretization. That reference branch uses body +Z thrust with upward-world conventions, so its thrust signs are **not** copied into this NED/FRD implementation.
+
+### Verification
+
+The build/test commands above now run **21 tests: 13 mathematical tests and 8 dynamics tests**, all passing on Jetson in standalone Release and colcon builds. Dynamics tests cover zero time, hover at different yaw angles, free fall, excess thrust, tilted thrust evaluated at the current attitude, right-multiplied body-rate rotation with time scaling, supplied gravity, and 1,000 chained steps checked against discrete ballistics and closed-form attitude.
+
+For dynamics tests alone:
+
+```bash
+ctest --test-dir ~/uav_control_ws/so3-math-build -R '^Dynamics\.' --output-on-failure
+```
+
+An independent program compiled directly against the installed header without sourcing ROS, with Eigen heap allocation disabled and assertions enabled. Across 1,000 steps of 2 ms, yawing hover had zero position/velocity drift and a rotation-matrix error of `1.48e-14`. A tilted, constant-thrust trajectory matched its discrete closed-form solution with position error `6.31e-14 m` and velocity error `1.21e-13 m/s`. This verifies the mathematical predictor, not physical flight or PX4 integration. The temporary program was removed after verification.
 
 ## Build and environment
 
