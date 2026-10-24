@@ -1,8 +1,8 @@
 # UAV OMMPC controller and ROS 2 / PX4 bridge
 
-ROS 2 Jazzy **C++17 / rclcpp** communication packages for PX4 v1.17. A separate controller supplies total thrust acceleration and body angular rates; the bridge relays telemetry and translates commands to PX4 offboard inputs. The Python bridge has been removed; `ros2 run uav_ommpc_ros px4_bridge` and all public topics, messages, QoS and startup parameters remain unchanged. Only the SITL test utilities use Python.
+ROS 2 Jazzy **C++17 / rclcpp** communication and control nodes for PX4 v1.17. `ommpc_node` consumes bridged odometry/status and upper-level reference trajectories, solves OMMPC, and publishes thrust acceleration/body rates to `px4_bridge`. The bridge relays telemetry and translates commands to PX4 offboard inputs. Existing bridge topics, QoS and startup parameters are unchanged.
 
-`uav_ommpc_controller` supplies standalone C++17/Eigen mathematical primitives, nonlinear single-step prediction, discrete local-error linearization and a condensed OMMPC optimizer using OSQP. The optimizer is a library, **not wired to ROS/PX4**; its included tracking executable exercises only the nonlinear mathematical model.
+`uav_ommpc_controller` supplies standalone C++17/Eigen mathematics, nonlinear single-step prediction, discrete local-error linearization and a condensed OMMPC optimizer using OSQP. `uav_ommpc_ros/ommpc_node` connects that library to ROS2 and the existing PX4 bridge. The standalone tracking executable still exercises only the nonlinear mathematical model.
 
 ## OMMPC mathematics (no ROS dependency)
 
@@ -362,11 +362,139 @@ The near-zero steady-state error is a **matched-model, disturbance-free simulati
 
 The condensed formulation follows the author [preprint](https://arxiv.org/html/2106.15233v1), Section V-C, equations (25)–(30), using the existing actual-minus-reference error convention. The reference repository's [`mpc_wrapper.hpp`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_core/include/ommpc_core/mpc_wrapper.hpp) uses an uncondensed sparse QP; this implementation intentionally follows the paper's **condensed** form and reuses its OSQP API rather than copying the per-cycle setup/cleanup pattern. Baseline weights come from [`params.yaml`](https://github.com/OliverWu515/ommpc_controller/blob/refact-decouple/ommpc_ros/config/params.yaml).
 
+## ROS2 OMMPC node
+
+`uav_ommpc_ros/src/ommpc_node.cpp` owns one controller and preallocated horizon buffers, using a single-threaded executor so subscription callbacks and the control timer cannot race.
+
+| Direction | Topic | Type | QoS |
+| --- | --- | --- | --- |
+| Subscribe, from bridge | `/uav/state` | `px4_msgs/msg/VehicleOdometry` | best effort, volatile, depth 1 |
+| Subscribe, from bridge | `/uav/status` | `px4_msgs/msg/VehicleStatus` | best effort, volatile, depth 1 |
+| Subscribe, from planner | `/uav/reference_trajectory` | `uav_ommpc_interfaces/msg/ReferenceTrajectory` | reliable, volatile, depth 1 |
+| Publish, to bridge | `/uav/control_input` | `uav_ommpc_interfaces/msg/ThrustRates` | reliable, volatile, depth 1 |
+
+There is no second odometry topic: `/uav/state` already contains the PX4 odometry. The node publishes neither arm/mode commands nor OffboardControlMode directly. Ensure **only one controller publishes `/uav/control_input`**; the bridge has no arbitration between competing publishers. Standard ROS remapping can isolate multiple vehicles or rename these topics.
+
+### Reference trajectory message and time
+
+`ReferenceState.msg` contains `float64[3] position`, `float64[3] velocity`, and a unit Hamilton `float64[4] q` in **w,x,y,z order**, body FRD to world NED. It is deliberately not a ROS geometry quaternion's xyzw order.
+
+`ReferenceTrajectory.msg` contains:
+
+- `header.frame_id = "ned"`; positions use exactly the same local NED origin as the PX4 odometry.
+- `header.stamp`: the **ROS-clock time of the first state sample**, not PX4 boot time, and not the end of the trajectory.
+- `dt`: the uniform sample period in seconds, matching the node's `dt` within `1e-9`.
+- `states`: M+1 `ReferenceState` entries, at most 2001.
+- `inputs`: M `ThrustRates` feedforward entries, at most 2000. Each input drives the corresponding state to the next state using `dynamic.hpp`. M must be at least the controller horizon N.
+
+At each control tick, `j = floor((ROS_now - header.stamp) / dt)` selects states `j..j+N` and inputs `j..j+N-1`. The complete window must exist. Future-start trajectories wait, and exhausted trajectories stop output: there is no interpolation, terminal-state hold, trajectory extrapolation or implicit position-to-attitude planner. The selection is quantized to the preceding sample (less than one dt of alignment error). The active window, not every future sample in a long message, is decoded and checked by the controller.
+
+Publish rolling trajectories, for example at 20–50 Hz with M=40 for the default N=20. A message containing exactly N inputs is usable only during its first sample interval; provide extra samples for delivery latency and the interval before the next reference update. Republishing a long trajectory may retain its original start stamp; sending an old message with a new stamp re-times that trajectory and is not equivalent. All upper-level publishers must use the same ROS time domain; synchronize clocks across computers.
+
+A position-only `nav_msgs/Path` is insufficient for this controller. It requires velocity, attitude and feedforward inputs that satisfy the discrete model. The model-consistent construction in `examples/ommpc_tracking.cpp` can be used by an upstream planner.
+
+Example message construction inside an existing Python ROS2 planner (publish through a reliable/volatile publisher and call again on each planner update):
+
+```python
+import math
+from uav_ommpc_interfaces.msg import ReferenceState, ReferenceTrajectory, ThrustRates
+
+def hover_reference(node, position_ned, yaw_rad):
+    msg = ReferenceTrajectory()
+    msg.header.frame_id = "ned"
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.dt = 0.02
+    q = [math.cos(yaw_rad / 2), 0.0, 0.0, math.sin(yaw_rad / 2)]
+    msg.states = [
+        ReferenceState(position=list(position_ned), velocity=[0.0, 0.0, 0.0], q=q)
+        for _ in range(41)
+    ]
+    msg.inputs = [
+        ThrustRates(thrust_acceleration=9.80665, body_rates=[0.0, 0.0, 0.0])
+        for _ in range(40)
+    ]
+    return msg
+```
+
+The hover position/yaw are explicit application choices in the current local frame, not automatically inferred takeoff targets. This example matches the default gravity/dt. Do not use an arbitrary origin or run a test publisher against an aircraft.
+
+### State conversion and output gating
+
+- Odometry pose frame must be `POSE_FRAME_NED`. Velocity may be `VELOCITY_FRAME_NED`, or `VELOCITY_FRAME_BODY_FRD`, in which case it is rotated by the body-to-world attitude. Arbitrary-heading FRD navigation frames and unknown frames are rejected; no ENU/FLU conversion is performed.
+- Position, velocity and quaternion must be finite. Quaternion norm must be within `1e-3` of one for float32 PX4 odometry, or `1e-6` for float64 reference states. Accepted quaternions are normalized before conversion to SO(3). Zero/nonunit quaternions are not repaired.
+- The installed PX4 message labels `quality` as unused; its default zero is **not** used to reject otherwise valid odometry. Measured angular velocity and covariance are not consumed by this p/v/R model.
+- PX4 `timestamp_sample` must be positive, no greater than the message timestamp, and strictly advance before refreshing the odometry cache. Status timestamps must also advance. These boot-time values are never compared to ROS wall time. Duplicates/out-of-order packets do not refresh freshness. Restart the node after PX4 reboots and its timestamps return to a smaller epoch.
+- Fresh valid odometry, fresh reference receipt and fresh healthy vehicle status are all required. Vehicle status must report rotary-wing operation, not a VTOL transition, no failsafe and no termination mode. A fresh invalid odometry packet invalidates the cached state rather than continuing on its old value.
+- A changed odometry `reset_counter` invalidates the cached reference. The planner must publish a new trajectory in the updated local frame; the node cannot determine whether the planner actually corrected its origin. A backward ROS clock jump also invalidates the reference.
+- Malformed replacement reference metadata invalidates the old plan. Invalid selected poses, inconsistent dynamics, out-of-bound feedforward or solver failure produce **no control message**. Normal periodic solves resume only when the selected inputs are usable; no zero-thrust or last-solution fallback is generated.
+- After solving, the node checks freshness/window selection again. A solve exceeding one timer period or crossing into a different reference window is discarded rather than publishing a late command.
+
+The node deliberately does **not** require armed/Offboard status: valid pre-Offboard inputs let the bridge prime its heartbeat. The unchanged bridge only forwards angular-rate setpoints while PX4 reports Offboard. Neither node requests arming or a flight mode.
+
+Stopping node publication is **not an immediate revocation of the last bridge command**. The bridge can repeat it for up to its `command_timeout` (default 0.5 s), after which heartbeat/setpoints stop and PX4's configured Offboard-loss behavior applies. This existing failover delay remains unchanged; it is not an automatic controlled landing.
+
+### Startup parameters and running
+
+All controller/timeout parameters are **read-only after startup**. Restart the node to change them.
+
+| Parameter | Default / meaning |
+| --- | --- |
+| `horizon`, `dt` | `20`, `0.02 s`; timer period equals prediction step |
+| `gravity` | `9.80665 m/s²` |
+| `odometry_timeout` | `0.2 s`, steady-clock age of last advancing valid sample |
+| `status_timeout` | `1.5 s`, steady-clock age of last advancing status (PX4 may publish at 2 Hz) |
+| `reference_timeout` | `0.5 s`, steady-clock age of latest accepted trajectory message |
+| `state_weights`, `terminal_weights` | Nine-element diagonal weights; terminal default is twice the configured state weights |
+| `input_weights` | Four-element vector, default `[0.5, 1.2, 1.2, 0.6]` |
+| `input_min`, `input_max` | Four-element `[thrust, wx, wy, wz]` bounds; same defaults as the controller library |
+| `max_iterations` | `400` |
+| `absolute_tolerance`, `relative_tolerance` | `1e-5`, `1e-5` |
+
+The node accepts dt in `[1e-6,1]` seconds for representable timer configuration; that is not a guarantee of achieving those rates. Keep the intended 0.02 s step unless timing, horizon, reference generation and vehicle limits are retuned together. Timeouts must be finite and positive. Keep MPC input bounds consistent with bridge limits and vehicle calibration.
+
+After building and sourcing the underlays/overlay as below:
+
+```bash
+# Terminal 1: bridge, with the existing x500 calibration when using that simulator.
+ros2 run uav_ommpc_ros px4_bridge --ros-args -p hover_thrust:=0.728744
+
+# Terminal 2: controller; waits silently with respect to control output until inputs are ready.
+ros2 run uav_ommpc_ros ommpc_node --ros-args \
+  -p horizon:=20 -p dt:=0.02 \
+  -p odometry_timeout:=0.2 -p status_timeout:=1.5 -p reference_timeout:=0.5
+```
+
+The PX4/DDS transport and an upper-level trajectory publisher are separate prerequisites. The node does not start them. If using `use_sim_time`, odometry transport, planner and controller must share the intended clock; no control is produced before ROS time is positive. Never run the old test-flight controller concurrently with `ommpc_node`.
+
+### Observed ROS integration verification
+
+All three packages built on Jetson. `colcon test-result --verbose` reported **61 tests, 0 errors, 0 failures, 0 skipped**, including the 14 new frame/quaternion/reference-window tests, existing bridge tests and controller tests.
+
+An isolated smoke scenario ran the **actual installed `ommpc_node` and `px4_bridge` processes** with ROS_DOMAIN_ID=173 and localhost-only discovery. It supplied synthetic PX4 odometry/status and timed planner messages; no DDS Agent, PX4 simulator or physical aircraft was connected. Status remained DISARMED. No VehicleCommand was published or observed.
+
+| Exercised path | Observed result |
+| --- | --- |
+| No upper-level reference | No controller output, bridge heartbeat or rate setpoint |
+| Valid inputs in POSCTL | Solver produced ThrustRates; bridge primed heartbeat but emitted no rate setpoints |
+| Synthetic OFFBOARD status | Bridge emitted rates and normalized thrust matching actual controller outputs |
+| Position error `[0.2,-0.1,0.1] m` about a hover reference | Approximately `12 m/s²`, body rates `[2.085712,3.000000,0] rad/s` |
+| Reversed horizontal position errors | Roll/pitch correction signs reversed |
+| Consistent constant-velocity reference | Solver and bridge outputs continued |
+| Invalid/NaN odometry, frozen/out-of-order samples, stopped telemetry/status | Controller stopped; bridge became quiet after its 0.5 s command timeout |
+| Failsafe, VTOL transition, fixed-wing or termination status | No continued controller output |
+| Bad reference frame/dt/quaternion/count, inconsistent dynamics, future/exhausted reference, stopped publisher | No continued controller output |
+| Estimator reset | Reference invalidated while still fresh; silence observed at age 0.121 s, below the 0.20 s test timeout; a new reference restored operation |
+| `max_iterations=1` with nonzero tracking error | Actual node log reported `OSQP=-2, iterations=1`; no command or downstream heartbeat/rate output |
+
+The scenario used shorter test timeouts (`odometry_timeout=0.12`, `status_timeout=0.35`, `reference_timeout=0.20`) and checked their parameter values/read-only descriptor through ROS services. Across its phases it observed 1,604 bridged odometry messages, 1,592 statuses, 359 controller commands, 912 heartbeats, 875 downstream rate messages, and zero VehicleCommands. Process logs were retained at `/tmp/ommpc-node-smoke-gxdhnoyk`; the temporary scenario program was removed after verification.
+
+This verifies ROS message generation, QoS compatibility, actual solver invocation, bridge conversion and failure gating. It is **not** a new SITL flight or real-hardware validation; earlier flight results below belong to the bridge's separate test controller.
+
 ## Build and environment
 
 Dependencies on this Jetson: ROS 2 Jazzy (`/opt/ros/jazzy`), `px4_msgs` release/1.17 in `~/ros2_px4_ws`, PX4 v1.17.0 in `~/PX4-Autopilot`, Gazebo Harmonic and Micro XRCE-DDS Agent v2.4.3. Build the PX4 message workspace before this overlay. Message definitions must match PX4.
 
-`uav_ommpc_ros` uses `ament_cmake` and links against `rclcpp`, `px4_msgs` and `uav_ommpc_interfaces`. When migrating an already-built Python workspace, remove its obsolete generated `build/uav_ommpc_ros` and `install/uav_ommpc_ros` directories before rebuilding; source the ROS/px4_msgs underlays, not the old project overlay.
+`uav_ommpc_ros` uses `ament_cmake`; `ommpc_node` links the standalone `uav_ommpc_controller` library in addition to ROS2, PX4 and project message dependencies. The interface package now generates timed reference messages using `std_msgs/Header`. When migrating an already-built Python workspace, remove its obsolete generated `build/uav_ommpc_ros` and `install/uav_ommpc_ros` directories before rebuilding; source the ROS/px4_msgs underlays, not the old project overlay.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -374,7 +502,7 @@ cd ~/ros2_px4_ws
 colcon build --symlink-install --packages-select px4_msgs
 source ~/ros2_px4_ws/install/setup.bash
 cd ~/uav_control_ws
-colcon build --symlink-install --packages-select uav_ommpc_interfaces uav_ommpc_ros \
+colcon build --symlink-install --packages-select uav_ommpc_interfaces uav_ommpc_controller uav_ommpc_ros \
   --cmake-args -DCMAKE_BUILD_TYPE=Release
 source ~/uav_control_ws/install/setup.bash
 ```
@@ -407,6 +535,7 @@ All topics use volatile durability and depth 1; no commands are retained for fut
 | `/uav/status` | `px4_msgs/msg/VehicleStatus` | best effort | Unmodified PX4 vehicle status |
 | `/uav/command_ack` | `px4_msgs/msg/VehicleCommandAck` | best effort | Unmodified PX4 command acknowledgements |
 | `/uav/vehicle_command` | `px4_msgs/msg/VehicleCommand` | reliable | Explicit mode/arm/land/etc. request |
+| `/uav/reference_trajectory` | `uav_ommpc_interfaces/msg/ReferenceTrajectory` | reliable | Timed full-state and feedforward trajectory for `ommpc_node` |
 
 `ThrustRates` fields:
 
@@ -454,7 +583,7 @@ The bridge does not send zero thrust, land, disarm, retry, or choose recovery mo
 
 ## Unit tests
 
-Input validation, limits and timeout logic live in `uav_ommpc_ros/src/command_state.hpp` and are tested with injected time (no ROS or PX4 needed):
+Bridge input validation, limits and timeout logic live in `uav_ommpc_ros/src/command_state.hpp` and use injected time in tests. `src/ommpc_inputs.hpp` adds the node's odometry/reference decoding and timestamp-window helpers; tests cover NED/BODY_FRD velocity, Hamilton quaternion order/precision, invalid data and overflow-safe window boundaries. Neither test suite needs running ROS/PX4 processes:
 
 ```bash
 cd ~/uav_control_ws

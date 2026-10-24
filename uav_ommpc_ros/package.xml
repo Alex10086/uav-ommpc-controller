@@ -2,11 +2,13 @@
 <package format="3">
   <name>uav_ommpc_ros</name>
   <version>0.1.0</version>
-  <description>Minimal ROS 2 body-rate and thrust bridge to PX4.</description>
+  <description>ROS 2 OMMPC control node and body-rate/thrust bridge to PX4.</description>
   <maintainer email="maintainer@uav-ommpc-controller.invalid">xerolab</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>uav_ommpc_controller</depend>
   <depend>px4_msgs</depend>
   <depend>uav_ommpc_interfaces</depend>
   <test_depend>ament_cmake_gtest</test_depend>
