@@ -26,7 +26,7 @@ from px4_msgs.msg import (VehicleOdometry, VehicleStatus, VehicleCommand,
                           VehicleCommandAck, VehicleLandDetected,
                           VehicleRatesSetpoint, OffboardControlMode)
 from uav_ommpc_interfaces.msg import ThrustRates
-from reference_test_publisher import ReferencePublisher, sample_reference
+from reference_test_publisher import ReferencePublisher, VEHICLES, sample_reference
 
 MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover')
 TOPICS = ('/uav/reference_polynomial', '/uav/state', '/uav/status',
@@ -70,11 +70,14 @@ def finite_or_none(value):
 
 
 class Flight(ReferencePublisher):
-    def __init__(self, out, modes):
+    def __init__(self, out, modes, vehicle='x500', max_thrust=None):
+        self.f_vehicle = vehicle
+        self.f_max_thrust = float(VEHICLES[vehicle]['max_thrust'] if max_thrust is None else max_thrust)
         super().__init__(mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
                          rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
                          start_delay=2., ramp=3., line_duration=8.,
-                         direction=(1., 0., 0.), node_name='sitl_ommpc_test')
+                         direction=(1., 0., 0.), max_thrust=self.f_max_thrust,
+                         node_name='sitl_ommpc_test')
         self.publish_enabled = False
         self.f_out, self.f_modes = out, modes
         self.f_started = time.monotonic()
@@ -102,6 +105,8 @@ class Flight(ReferencePublisher):
         self.f_bound_violations = 0
         self.f_max_height = 0.
         self.f_result = {'passed': False, 'modes_requested': modes,
+                         'vehicle': vehicle,
+                         'max_thrust_m_s2': self.f_max_thrust,
                          'sitl_confirmation': 'explicit operator flag; DDS does not establish model identity',
                          'criteria': {'settle_window_s': 5., 'position_m': .35,
                                       'speed_m_s': .3, 'tilt_rad': .25, 'yaw_rad': .2,
@@ -203,7 +208,7 @@ class Flight(ReferencePublisher):
     def f_on_input(self, msg):
         now = time.monotonic()
         values = np.array([msg.thrust_acceleration, *msg.body_rates], dtype=float)
-        valid = bool(np.all(np.isfinite(values)) and 1.-1e-4 <= values[0] <= 12.+1e-4 and
+        valid = bool(np.all(np.isfinite(values)) and 1.-1e-4 <= values[0] <= self.f_max_thrust+1e-4 and
                      np.all(np.abs(values[1:]) <= np.array([3., 3., 1.5])+1e-4))
         gap = now-self.f_input_at
         self.f_input_writer.writerow([self.f_time(), self.f_phase, *values, gap if math.isfinite(gap) else '', valid])
@@ -637,6 +642,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--confirm-sitl', action='store_true', required=True,
                         help='Confirm ONLY the intended simulated PX4 is reachable in this DDS domain')
+    parser.add_argument('--vehicle', choices=tuple(VEHICLES), default='x500',
+                        help='Vehicle profile setting default max-thrust (x500=12 m/s^2, super=20 m/s^2)')
+    parser.add_argument('--max-thrust', type=float, default=None,
+                        help='Override maximum allowed thrust acceleration in m/s^2')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--mode', choices=MODES, help='Run one mode after takeoff')
     selection.add_argument('--modes', choices=MODES, nargs='+', help='Run selected modes in sequence (default: all five)')
@@ -656,7 +665,7 @@ def main():
     flight = None
     bag = bag_log = None
     try:
-        flight = Flight(out, modes)
+        flight = Flight(out, modes, vehicle=args.vehicle, max_thrust=args.max_thrust)
         if args.speed is not None:
             flight.config['speed'] = float(args.speed)
         if args.offset is not None:

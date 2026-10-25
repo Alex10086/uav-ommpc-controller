@@ -26,6 +26,7 @@ def load(directory):
     directory = Path(directory)
     result = json.loads((directory / 'result.json').read_text())
     phase = result['phases'][PHASE]
+    max_thrust = float(result.get('max_thrust_m_s2', THRUST_LIMITS[1]))
     thrust, rates, gaps = [], [], []
     with (directory / 'control_input.csv').open() as handle:
         for row in csv.DictReader(handle):
@@ -40,7 +41,7 @@ def load(directory):
     rates = np.array(rates) if rates else np.zeros((0, 3))
     gaps = np.array(gaps)
     saturated = np.isclose(thrust, THRUST_LIMITS[0], atol=1e-9) | \
-        np.isclose(thrust, THRUST_LIMITS[1], atol=1e-9)
+        np.isclose(thrust, max_thrust, atol=1e-9)
     if len(rates):
         saturated |= (np.abs(rates) >= RATE_LIMITS - 1e-9).any(axis=1)
     return {

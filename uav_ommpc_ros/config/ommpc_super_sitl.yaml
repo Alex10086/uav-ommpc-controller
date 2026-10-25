@@ -1,0 +1,22 @@
+# Gazebo SUPER (HKU MaRS YunQue, 280 mm wheelbase) / PX4 rate-loop tuning.
+# Not validated for real hardware; linear rotor drag (dh=0.35, dv=0.35) is not modeled yet.
+#
+# Hardware & parameter sources:
+# - Hardware BOM & CAD: https://github.com/hku-mars/SUPER-Hardware
+#   * 280 mm diagonal wheelbase (STEP motor centers at +-0.098995 m)
+#   * 4 x T-Motor F90 KV1300 + HQProp 7x4x3 + F60A 4-in-1 ESC + 6S 3300mAh LiPo
+#   * Max thrust per motor: 23.6 N (94.4 N total; motorConstant k_f = 2.36e-5 at 1000 rad/s)
+# - Mass discrepancy note:
+#   * Adopted mass: 1.64 kg from hku-mars/SUPER planner configs (super_planner/config/*.yaml, traj_opt.flatness.mass).
+#   * Paper value: 1.50 kg takeoff weight in Ren et al., Science Robotics 10(98), eado6187 (2025).
+# - Paired with px4_bridge hover_thrust=0.309128 (for 1.64 kg; 0.287942 if using 1.50 kg) and max_throttle=0.9.
+#   Bridge thrust ceiling at hover_thrust=0.309128 is 9.80665 * 0.9 / 0.309128 = 28.55 m/s^2 > 20.0 m/s^2.
+ommpc_node:
+  ros__parameters:
+    horizon: 30
+    dt: 0.02
+    state_weights: [30.0, 30.0, 60.0, 20.0, 20.0, 30.0, 80.0, 80.0, 40.0]
+    terminal_weights: [60.0, 60.0, 120.0, 40.0, 40.0, 60.0, 160.0, 160.0, 80.0]
+    input_weights: [4.0, 20.0, 20.0, 5.0]
+    input_min: [1.0, -3.0, -3.0, -1.5]
+    input_max: [20.0, 3.0, 3.0, 1.5]

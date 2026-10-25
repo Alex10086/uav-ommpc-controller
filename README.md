@@ -448,6 +448,8 @@ All controller/timeout parameters are **read-only after startup**. Restart the n
 
 The node accepts dt in `[1e-6,1]` seconds for representable timer configuration; that is not a guarantee of achieving those rates. Keep the intended 0.02 s step unless timing, horizon, reference generation and vehicle limits are retuned together. Timeouts must be finite and positive. Keep MPC input bounds consistent with bridge limits and vehicle calibration.
 
+
+[You have received this identical output 3 times. Re-reading 'ssh://jetson4/home/xerolab/uav_control_ws/src/uav-ommpc-controller/README.md:raw:1-450' will not change it — use a narrower selector (path:A-B), or proceed with the edit.]
 After building and sourcing the underlays/overlay as below:
 
 ```bash
@@ -742,6 +744,53 @@ Tilt, interruptions and saturation:
 Neither controller saturates the **interface** limits at any speed; OMMPC never reaches a clip, while PD+SO(3) saturates its own `±1 rad/s` clamp (its existing tuning, tighter than the ±3/±3/±1.5 interface) and its per-axis acceleration clip at the two highest speeds. That asymmetry explains the divergence: PD+SO(3) prioritises gentle attitude over tracking, so its tilt stays near 0.19 rad while its position error grows. Occasional gaps just above 0.1 s appear in both and are Python-side scheduling/rosbag effects, far below the 0.3 s acceptance limit.
 
 Attribution caveat: OMMPC additionally benefits from a 30-step prediction horizon and per-step feedforward, while PD+SO(3) is a reactive law with the repository's low-gain default tuning. The comparison therefore answers "does the added MPC machinery beat the existing PD + SO(3) baseline under identical trajectory, vehicle and initial conditions" — at 1.6–2.0 m/s it does, at 0.8 m/s the two are within run-to-run noise. Both are simulated results.
+
+### HKU MaRS SUPER (`gz_super`) vehicle profile and mass discrepancy note
+
+In addition to the default `x500` model (`hover_thrust=0.728744`, `uav_ommpc_ros/config/ommpc_sitl.yaml`), this workspace and `~/PX4-Autopilot` include the **HKU MaRS SUPER (YunQue)** 280 mm quadrotor (`gz_super`, airframe `4022_gz_super`, Gazebo models `Tools/simulation/gz/models/super_base` and `super`, controller config `uav_ommpc_ros/config/ommpc_super_sitl.yaml`), derived from [`hku-mars/SUPER-Hardware`](https://github.com/hku-mars/SUPER-Hardware), [`hku-mars/SUPER`](https://github.com/hku-mars/SUPER) and Ren et al., *Science Robotics* 10(98), eado6187 (2025):
+
+| Parameter | `x500` (preserved default) | `super` (`gz_super`) | Source / note |
+| --- | --- | --- | --- |
+| PX4 SITL target / airframe | `gz_x500` (`4001_gz_x500`) | `gz_super` (`4022_gz_super`) | `~/PX4-Autopilot` |
+| Wheelbase / rotor `(px, py)` | `500 mm` / `(±0.174, ±0.174) m` | `280 mm` / `(±0.098995, ±0.098995) m` | Measured from `CarbonFiber/5mm_main_board.STEP` |
+| Total simulated mass | `2.06430769 kg` | **`1.64 kg`** (`1.58 kg` base + `4 × 0.015 kg` rotors) | **Discrepancy note:** `hku-mars/SUPER` planner configs (`super_planner/config/*.yaml`, `traj_opt.flatness.mass`) specify **`1.64 kg`** (adopted here), whereas the *Science Robotics* paper (p. 13) reports **`1.50 kg`** takeoff weight |
+| Propulsion / `motorConstant` | `8.54858e-6` (`1000 rad/s`) | `2.36e-5` (`1000 rad/s`, `23.6 N` max/motor, `94.4 N` total) | T-Motor F90 KV1300 + HQProp 7×4×3 on 6S (`BAT1_N_CELLS=6`) |
+| Calibrated `hover_thrust` | `0.728744` | **`0.309128`** (for `1.64 kg`; `0.287942` if using `1.50 kg`) | `omega_hover = sqrt(1.64 * 9.80665 / (4 * 2.36e-5)) = 412.7587 rad/s`, `(412.7587 - 150) / 850 = 0.309128` |
+| OMMPC ROS config | `config/ommpc_sitl.yaml` (`input_max=[12, 3, 3, 1.5]`) | `config/ommpc_super_sitl.yaml` (`input_max=[20, 3, 3, 1.5]`) | Bridge ceiling at `hover_thrust=0.309128, max_throttle=0.9` is `28.55 m/s² > 20.0 m/s²` |
+| Linear rotor drag (`dh, dv`) | Not modeled | **Not modeled (omitted by design for now)** | `hku-mars/SUPER` uses `dh=0.35, dv=0.35`; current OMMPC dynamics/sampler remain drag-free |
+
+To run `gz_super` in SITL alongside the existing `x500` workflow:
+
+```bash
+# Terminal 2: PX4 and headless Gazebo with SUPER model.
+source ~/px4-env.bash
+cd ~/PX4-Autopilot
+HEADLESS=1 make -j4 px4_sitl gz_super
+
+# Terminal 3: bridge calibrated for 1.64 kg SUPER.
+source ~/ros2-px4-env.bash
+source ~/uav_control_ws/install/setup.bash
+ros2 run uav_ommpc_ros px4_bridge --ros-args -p hover_thrust:=0.309128
+
+# Terminal 4: OMMPC with SUPER SITL parameters.
+source ~/ros2-px4-env.bash
+source ~/uav_control_ws/install/setup.bash
+ros2 run uav_ommpc_ros ommpc_node --ros-args --params-file \
+  "$(ros2 pkg prefix uav_ommpc_ros)/share/uav_ommpc_ros/config/ommpc_super_sitl.yaml"
+
+# Terminal 5: SITL flight test using the super profile (max_thrust=20 m/s²).
+cd ~/uav_control_ws/src/uav-ommpc-controller
+python3 tools/sitl_ommpc_test.py --confirm-sitl --vehicle super --modes hover hover_to_hover --speed 0.8 \
+  --output-dir ~/uav_control_ws/ommpc-flight-results/super-hover-0.8ms
+```
+
+Observed `gz_super` SITL verification (`~/uav_control_ws/ommpc-flight-results/super-hover-0.8ms`, `passed=true`, max takeoff height `2.031 m`, confirmed native `NAV_LAND` and disarm):
+
+| Phase (`gz_super`, `1.64 kg`) | Position RMSE (m) | Max position error (m) | Velocity RMSE (m/s) | Max tilt (rad) | Max bridge throttle | Bound violations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Polynomial takeoff (`2.0 m`) | 0.0242 | 0.0402 | 0.0115 | 0.0038 | 0.3117 | 0 |
+| Hover (`5 s` settled) | 0.0368 | 0.0470 | 0.0137 | 0.0034 | 0.3090 | 0 |
+| `hover_to_hover` (`0.8 m/s`) | 0.0508 | 0.1142 | 0.0464 | 0.1917 | 0.3131 | 0 |
 
 ### Historical PX4/Gazebo results — sampled-reference version
 

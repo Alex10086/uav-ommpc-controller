@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from reference_test_publisher import (G, Trajectory, check_message, evaluate_segment,
+from reference_test_publisher import (G, Trajectory, VEHICLES, check_message, evaluate_segment,
                                       hermite7, rotation, sample_flat, sample_reference)
 
 
@@ -70,7 +70,6 @@ class PolynomialTrajectoryTests(unittest.TestCase):
         np.testing.assert_allclose(state.position, [0., 3.3, 0.], atol=1e-12)
         np.testing.assert_allclose(state.velocity, np.zeros(3), atol=1e-12)
 
-
     def test_hover_to_hover_seventh_order_smoothness_and_speed_scaling(self):
         offset = np.array([1.2, -0.6, 0.0])
         dist = float(np.linalg.norm(offset))
@@ -98,6 +97,7 @@ class PolynomialTrajectoryTests(unittest.TestCase):
             state_end = sample_reference(msg_end, 50.)
             np.testing.assert_allclose(state_end.position, np.array([1.2, -0.6, -2.0]), atol=1e-12)
             np.testing.assert_allclose(state_end.velocity, np.zeros(3), atol=1e-12)
+
     def test_circle_approximates_analytic_geometry_and_preserves_heading(self):
         origin = np.array([1., -2., -3.])
         trajectory = Trajectory('circle', origin=origin, yaw=1.67, radius=.6, speed=.25)
@@ -165,6 +165,23 @@ class PolynomialTrajectoryTests(unittest.TestCase):
         malformed.segments[1].x[0] += .001
         with self.assertRaises(ValueError):
             check_message(malformed)
+
+    def test_super_vehicle_profile_and_high_thrust_ceiling(self):
+        self.assertEqual(VEHICLES['x500']['max_thrust'], 12.0)
+        self.assertAlmostEqual(VEHICLES['x500']['hover_thrust'], 0.728744, places=6)
+        self.assertEqual(VEHICLES['super']['max_thrust'], 20.0)
+        self.assertEqual(VEHICLES['super']['mass_kg'], 1.64)
+        self.assertEqual(VEHICLES['super']['paper_mass_kg'], 1.50)
+        self.assertAlmostEqual(VEHICLES['super']['hover_thrust'], 0.309128, places=6)
+        # Vertical climb at 2.0 m/s peak requires ~12.95 m/s^2 thrust: rejected for x500 (12 m/s^2), accepted for super (20 m/s^2).
+        with self.assertRaises(ValueError):
+            Trajectory('hover_to_hover', offset=[0., 0., -2.], speed=2.0, max_thrust=12.0).message(10**9, 2.5)
+        super_traj = Trajectory('hover_to_hover', offset=[0., 0., -2.], speed=2.0,
+                                max_thrust=VEHICLES['super']['max_thrust'])
+        msg = super_traj.message(10**9, 2.5)
+        maxima = check_message(msg, max_thrust=VEHICLES['super']['max_thrust'])
+        self.assertGreater(maxima[0], 12.0)
+        self.assertLessEqual(maxima[0], 20.0)
 
 
 if __name__ == '__main__':

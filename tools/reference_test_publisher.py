@@ -23,6 +23,19 @@ from uav_ommpc_interfaces.msg import PolynomialSegment, PolynomialTrajectory
 G = 9.80665
 MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover')
 RATE_LIMITS = np.array([3.0, 3.0, 1.5])
+VEHICLES = {
+    'x500': {
+        'max_thrust': 12.0,
+        'hover_thrust': 0.728744,
+        'mass_kg': 2.06430769,
+    },
+    'super': {
+        'max_thrust': 20.0,
+        'hover_thrust': 0.309128,
+        'mass_kg': 1.64,        # hku-mars/SUPER planner config (traj_opt.flatness.mass)
+        'paper_mass_kg': 1.50,  # Ren et al., Science Robotics 10(98), eado6187 (2025)
+    },
+}
 
 
 def vector3(value, name):
@@ -185,7 +198,8 @@ class Trajectory:
     """Analytic geometry and cached, overlapping polynomial publication windows."""
     def __init__(self, mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
                  rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
-                 start_delay=2., ramp=3., line_duration=8., direction=(1., 0., 0.)):
+                 start_delay=2., ramp=3., line_duration=8., direction=(1., 0., 0.),
+                 max_thrust=12.):
         if mode not in MODES:
             raise ValueError(f'mode must be one of {MODES}')
         self.mode = mode
@@ -195,10 +209,13 @@ class Trajectory:
             raise ValueError('yaw must be finite')
         for name, value in (('window', window), ('segment_duration', segment_duration),
                             ('rate', rate), ('speed', speed), ('radius', radius),
-                            ('ramp', ramp), ('line_duration', line_duration)):
+                            ('ramp', ramp), ('line_duration', line_duration),
+                            ('max_thrust', max_thrust)):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{name} must be finite and positive')
             setattr(self, name, float(value))
+        if self.max_thrust <= G:
+            raise ValueError('max_thrust must exceed gravity')
         if not math.isfinite(start_delay) or start_delay < 0.0:
             raise ValueError('start_delay must be finite and nonnegative')
         if window < 2. or segment_duration < .05 or segment_duration > window/2.:
@@ -331,7 +348,7 @@ class Trajectory:
                 dist = float(np.linalg.norm(self.offset))
                 duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
                 msg.hold_final = end >= self.start_delay+duration
-        check_message(msg)
+        check_message(msg, max_thrust=self.max_thrust)
         self._cached_key, self._cached_message = key, msg
         return msg
 
@@ -341,10 +358,11 @@ class ReferencePublisher(Node):
     def __init__(self, *, mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
                  rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
                  start_delay=2., ramp=3., line_duration=8., direction=(1., 0., 0.),
-                 node_name='reference_test_publisher'):
+                 max_thrust=12., node_name='reference_test_publisher'):
         self.config = dict(window=window, segment_duration=segment_duration, rate=rate, offset=offset,
                            speed=speed, radius=radius, start_delay=start_delay,
-                           ramp=ramp, line_duration=line_duration, direction=direction)
+                           ramp=ramp, line_duration=line_duration, direction=direction,
+                           max_thrust=max_thrust)
         Trajectory(mode=mode, origin=origin, yaw=yaw, **self.config)
         super().__init__(node_name)
         self.publish_enabled = True
@@ -405,13 +423,15 @@ class ReferencePublisher(Node):
             self.get_logger().error(f'Reference generation failed; publishing STOPPED: {exc}')
 
 
-def check_message(msg):
+def check_message(msg, max_thrust=12.):
     """Check C3/C1 knots, stationary hold and sampled analytic physical bounds.
 
     This diagnostic is not a proof of between-sample actuator feasibility; the
     controller independently checks every feedforward input it actually uses.
     Euler discretization residuals are deliberately NOT required to vanish.
     """
+    if not math.isfinite(max_thrust) or max_thrust <= G:
+        raise ValueError('max_thrust must be finite and exceed gravity')
     if msg.header.frame_id != 'ned' or not 1 <= len(msg.segments) <= 100:
         raise ValueError('invalid polynomial frame or segment count')
     previous = None
@@ -429,8 +449,8 @@ def check_message(msg):
                     raise ValueError(f'discontinuous polynomial {name}')
         for t in np.linspace(0., segment.duration, max(2, math.ceil(segment.duration/.05)+1)):
             ref = flat_reference(evaluate_segment(segment, t))
-            if not 1. <= ref.thrust_acceleration <= 12.:
-                raise ValueError('generated thrust exceeds [1, 12] m/s^2')
+            if not 1. <= ref.thrust_acceleration <= max_thrust:
+                raise ValueError(f'generated thrust exceeds [1, {max_thrust:g}] m/s^2')
             if np.any(np.abs(ref.body_rates) > RATE_LIMITS):
                 raise ValueError('generated body rates exceed [3, 3, 1.5] rad/s')
             maxima = np.maximum(maxima, [ref.thrust_acceleration, *np.abs(ref.body_rates)])
@@ -444,6 +464,10 @@ def check_message(msg):
 def parser():
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     cli.add_argument('--mode', choices=MODES, default='hover')
+    cli.add_argument('--vehicle', choices=tuple(VEHICLES), default='x500',
+                     help='Vehicle profile setting default max-thrust (x500=12 m/s^2, super=20 m/s^2)')
+    cli.add_argument('--max-thrust', type=float, default=None,
+                     help='Override maximum allowed feedforward thrust acceleration in m/s^2')
     cli.add_argument('--origin', nargs=3, type=float, metavar=('N', 'E', 'D'), help='NED meters; default: first valid odometry')
     cli.add_argument('--yaw', type=float, help='NED yaw radians; default: first valid odometry')
     cli.add_argument('--window', type=float, default=4., help='Polynomial window seconds (>=2); must cover the controller horizon plus transport age')
@@ -466,6 +490,9 @@ def main():
     args, ros_args = cli.parse_known_args()
     options = vars(args).copy()
     duration, check = options.pop('duration'), options.pop('check')
+    vehicle = options.pop('vehicle')
+    if options['max_thrust'] is None:
+        options['max_thrust'] = VEHICLES[vehicle]['max_thrust']
     try:
         if duration is not None and (not math.isfinite(duration) or duration <= 0.0):
             raise ValueError('duration must be finite and positive')
@@ -481,11 +508,13 @@ def main():
             else:
                 end = trajectory.start_delay+trajectory.window
             for elapsed in np.arange(0., end+trajectory.segment_duration, trajectory.segment_duration):
-                maxima = np.maximum(maxima, check_message(trajectory.message(1_000_000_000, elapsed)))
+                maxima = np.maximum(maxima, check_message(
+                    trajectory.message(1_000_000_000, elapsed), max_thrust=trajectory.max_thrust))
             if args.mode == 'target_step':
                 maxima = np.maximum(maxima, check_message(
-                    trajectory.message(1_000_000_000, trajectory.start_delay)))
-            print(f'{args.mode}: analytic C3/C1 polynomial windows checked through {end:.3f}s; '
+                    trajectory.message(1_000_000_000, trajectory.start_delay), max_thrust=trajectory.max_thrust))
+            print(f'{args.mode} ({vehicle}, max_thrust={trajectory.max_thrust:g}): '
+                  f'analytic C3/C1 polynomial windows checked through {end:.3f}s; '
                   f'sampled max thrust/body-rate magnitudes={maxima.tolist()}; '
                   'not a continuous-time actuator-feasibility certificate')
             return 0
