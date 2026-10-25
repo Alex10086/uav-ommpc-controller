@@ -3,7 +3,7 @@
 # each starts landed and disarmed with the same initial condition.
 #
 #   SPEEDS='0.8 1.6 2.0' REPEATS=3 LABEL=ommpc bash tools/sitl_hover_to_hover_sweep.sh
-#   VEHICLE=super SPEEDS='0.8 1.6 2.0' REPEATS=1 LABEL=super bash tools/sitl_hover_to_hover_sweep.sh
+#   VEHICLE=super SPEEDS='0.8 1.6 2.0' REPEATS=3 LABEL=super-tuned bash tools/sitl_hover_to_hover_sweep.sh
 #
 # The controller under test runs separately (ommpc_node or tools/pd_so3_node.py);
 # this script only publishes references and records evidence. Test-only: never
@@ -15,10 +15,11 @@ SPEEDS="${SPEEDS:-0.4 0.8 1.2 1.6 2.0}"
 OFFSET="${OFFSET:-2.0 0.0 0.0}"
 REPEATS="${REPEATS:-1}"
 LABEL="${LABEL:-sweep}"
+RECORD_BAG="${RECORD_BAG:-1}"
 OUT_ROOT="${OUT_ROOT:-$HOME/uav_control_ws/ommpc-flight-results}"
 
 restart_px4() {
-  pkill -9 -f 'bin/px4' 2>/dev/null
+  pkill -9 -x px4 2>/dev/null
   pkill -9 -f 'gz sim' 2>/dev/null
   sleep 2
   (
@@ -38,15 +39,25 @@ restart_px4() {
 source "$HOME/ros2-px4-env.bash"
 source "$HOME/uav_control_ws/install/setup.bash"
 
+BAG_ARG=""
+if [ "$RECORD_BAG" = "1" ]; then
+  BAG_ARG="--record-bag"
+fi
+
 for speed in $SPEEDS; do
   for run in $(seq 1 "$REPEATS"); do
+    out_dir="$OUT_ROOT/${LABEL}-${speed}ms-r${run}"
+    rm -rf "$out_dir"
     echo "=== vehicle=${VEHICLE} target=${PX4_TARGET} label=${LABEL} speed=${speed} run=${run}/${REPEATS} offset=${OFFSET} ==="
     restart_px4
     cd "$HOME/uav_control_ws/src/uav-ommpc-controller" || exit 1
     python3 tools/sitl_ommpc_test.py --confirm-sitl --vehicle "$VEHICLE" --mode hover_to_hover \
-      --speed "$speed" --offset $OFFSET --record-bag \
-      --output-dir "$OUT_ROOT/${LABEL}-${speed}ms-r${run}" > /tmp/run-${LABEL}-${speed}-${run}.log 2>&1
+      --speed "$speed" --offset $OFFSET $BAG_ARG \
+      --output-dir "$out_dir" > /tmp/run-${LABEL}-${speed}-${run}.log 2>&1
     rc=$?
     echo "=== label=${LABEL} speed=${speed} run=${run} exit=${rc} ==="
   done
 done
+pkill -9 -x px4 2>/dev/null
+pkill -9 -f 'gz sim' 2>/dev/null
+true

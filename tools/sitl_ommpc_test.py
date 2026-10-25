@@ -26,9 +26,8 @@ from px4_msgs.msg import (VehicleOdometry, VehicleStatus, VehicleCommand,
                           VehicleCommandAck, VehicleLandDetected,
                           VehicleRatesSetpoint, OffboardControlMode)
 from uav_ommpc_interfaces.msg import ThrustRates
-from reference_test_publisher import ReferencePublisher, VEHICLES, sample_reference
+from reference_test_publisher import ReferencePublisher, VEHICLES, MODES, sample_reference
 
-MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover')
 TOPICS = ('/uav/reference_polynomial', '/uav/state', '/uav/status',
           '/uav/control_input', '/uav/vehicle_command', '/uav/command_ack',
           '/fmu/out/vehicle_odometry', '/fmu/out/vehicle_status_v1',
@@ -43,6 +42,7 @@ TRACE_FIELDS = ('time_s phase px4_timestamp_us north_m east_m down_m vn_m_s '
                 'input_thrust_m_s2 input_roll_rad_s input_pitch_rad_s input_yaw_rad_s '
                 'bridge_roll_rad_s bridge_pitch_rad_s bridge_yaw_rad_s bridge_thrust_z '
                 'input_age_s rates_age_s state_age_s status_age_s nav_state arming_state').split()
+SOLVE_TRACE_PATH = Path('/tmp/ommpc_solve_trace.csv')
 
 
 def rotation(q):
@@ -69,12 +69,46 @@ def finite_or_none(value):
     return value
 
 
+def load_solve_trace():
+    if not SOLVE_TRACE_PATH.is_file():
+        return []
+    rows = []
+    try:
+        with SOLVE_TRACE_PATH.open('r', newline='') as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    rows.append({
+                        'steady_s': float(row['steady_s']),
+                        'solve_us': float(row['solve_us']),
+                        'step_us': float(row['step_us']),
+                        'iterations': int(row['iterations']),
+                        'status': int(row['status']),
+                        'solver_status': int(row['solver_status']),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except OSError:
+        return []
+    return rows
+
+
 class Flight(ReferencePublisher):
-    def __init__(self, out, modes, vehicle='x500', max_thrust=None):
+    def __init__(self, out, modes, vehicle='x500', max_thrust=None,
+                 abort_tilt_rad=0.6, max_pos_rmse=0.35, max_vel_rmse=0.30,
+                 speed_override=None, radius_override=None, z_amp_override=None,
+                 loops_override=None, ramp_override=None):
         self.f_vehicle = vehicle
         self.f_max_thrust = float(VEHICLES[vehicle]['max_thrust'] if max_thrust is None else max_thrust)
+        self.f_abort_tilt_rad = float(abort_tilt_rad)
+        self.f_max_pos_rmse = float(max_pos_rmse)
+        self.f_max_vel_rmse = float(max_vel_rmse)
+        self.f_speed_override = speed_override
+        self.f_radius_override = radius_override
+        self.f_z_amp_override = z_amp_override
+        self.f_loops_override = loops_override
+        self.f_ramp_override = ramp_override
         super().__init__(mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
-                         rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
+                         rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6, z_amp=.35, loops=None,
                          start_delay=2., ramp=3., line_duration=8.,
                          direction=(1., 0., 0.), max_thrust=self.f_max_thrust,
                          node_name='sitl_ommpc_test')
@@ -98,6 +132,7 @@ class Flight(ReferencePublisher):
         self.f_yaw = 0.
         self.f_last_reference = None
         self.f_acks, self.f_commands, self.f_rows = [], [], []
+        self.f_solve_rows = []
         self.f_phase_info = {}
         self.f_counts = {k: 0 for k in ('state', 'status', 'raw_state', 'raw_status',
                                       'land', 'control', 'rates', 'heartbeat', 'reference')}
@@ -110,9 +145,10 @@ class Flight(ReferencePublisher):
                          'sitl_confirmation': 'explicit operator flag; DDS does not establish model identity',
                          'criteria': {'settle_window_s': 5., 'position_m': .35,
                                       'speed_m_s': .3, 'tilt_rad': .25, 'yaw_rad': .2,
-                                      'moving_position_rmse_m': .35, 'moving_velocity_rmse_m_s': .3,
+                                      'moving_position_rmse_m': self.f_max_pos_rmse,
+                                      'moving_velocity_rmse_m_s': self.f_max_vel_rmse,
                                       'tracking_position_max_m': 1.,
-                                      'abort_position_m': 2., 'abort_tilt_rad': .6,
+                                      'abort_position_m': 2., 'abort_tilt_rad': self.f_abort_tilt_rad,
                                       'state_freshness_s': .2, 'status_freshness_s': 1.5,
                                       'control_freshness_s': .3},
                          'control_source': 'OMMPC; this process publishes references and vehicle commands only'}
@@ -318,8 +354,8 @@ class Flight(ReferencePublisher):
             raise RuntimeError('No current reference sample at ROS receipt time')
         if np.linalg.norm(np.array(self.f_state.position)-selected[0].position) > 2.:
             raise RuntimeError('Position error exceeds 2 m')
-        if math.acos(float(np.clip(rotation(self.f_state.q)[2, 2], -1., 1.))) > .6:
-            raise RuntimeError('Vehicle tilt exceeds 0.6 rad')
+        if math.acos(float(np.clip(rotation(self.f_state.q)[2, 2], -1., 1.))) > self.f_abort_tilt_rad:
+            raise RuntimeError(f'Vehicle tilt exceeds {self.f_abort_tilt_rad:g} rad')
         if self.f_bound_violations:
             raise RuntimeError('Observed controller/bridge input bound violation')
 
@@ -385,7 +421,10 @@ class Flight(ReferencePublisher):
 
     def f_set_hover(self, target):
         self.f_desired = np.asarray(target, dtype=float).copy()
+        saved_loops = self.config.get('loops')
+        self.config['loops'] = None
         self.set_trajectory('hover', self.f_desired, self.f_yaw)
+        self.config['loops'] = saved_loops
 
     def f_settle(self, target, timeout=45.):
         self.f_set_hover(target)
@@ -425,9 +464,9 @@ class Flight(ReferencePublisher):
             self.f_until(lambda: time.monotonic() >= end, 5., 'target-step delay and transition')
             self.f_settle(origin+np.array([.6, .3, 0.]))
         elif mode == 'constant_velocity':
-            self.config['speed'] = .3
+            self.config['speed'] = .3 if self.f_speed_override is None else float(self.f_speed_override)
             self.set_trajectory(mode, origin, self.f_yaw)
-            duration = 2.+8.+2.*3.
+            duration = self.config['start_delay']+self.config['line_duration']+2.*self.config['ramp']
             end = time.monotonic()+duration+.1
             self.f_until(lambda: time.monotonic() >= end, duration+3., 'ramped finite straight-line trajectory')
             selected = self.f_reference()
@@ -435,16 +474,41 @@ class Flight(ReferencePublisher):
                 raise RuntimeError('Missing terminal line reference')
             terminal = np.array(selected[0].position)
             self.f_settle(terminal)
-        elif mode == 'circle':
-            self.config['speed'] = .25
+        elif mode in ('circle', 'figure8', 'helix'):
+            if self.f_speed_override is not None:
+                self.config['speed'] = float(self.f_speed_override)
+            elif mode == 'circle':
+                self.config['speed'] = .25
+            else:
+                self.config['speed'] = 1.2
+            if self.f_radius_override is not None:
+                self.config['radius'] = float(self.f_radius_override)
+            elif mode in ('figure8', 'helix'):
+                self.config['radius'] = 1.2
+            if self.f_z_amp_override is not None:
+                self.config['z_amp'] = float(self.f_z_amp_override)
+            if self.f_ramp_override is not None:
+                self.config['ramp'] = float(self.f_ramp_override)
+            use_loops = self.f_loops_override
+            if use_loops is None and (mode in ('figure8', 'helix') or self.config['speed'] > 0.4):
+                # Ensure smooth braking back to origin on faster/complex curves
+                use_loops = 2.0
+            self.config['loops'] = use_loops
             self.set_trajectory(mode, origin, self.f_yaw)
-            duration = 2.+3.+max(18., 2.*math.pi*.6/.25)
-            end = time.monotonic()+duration
-            self.f_until(lambda: time.monotonic() >= end, duration+3., 'one complete smooth circle')
-            selected = self.f_reference()
-            if selected is None:
-                raise RuntimeError('Missing circle reference at completion')
-            self.f_settle(np.array(selected[0].position))
+            if self.config['loops'] is not None:
+                cruise = self.trajectory._curve_cruise_duration()
+                duration = self.config['start_delay'] + 2.0*self.config['ramp'] + cruise
+                end = time.monotonic() + duration + 0.5
+                self.f_until(lambda: time.monotonic() >= end, duration + 4., f'smooth {mode} trajectory')
+                self.f_settle(origin)
+            else:
+                duration = 2.+3.+max(18., 2.*math.pi*self.config['radius']/self.config['speed'])
+                end = time.monotonic()+duration
+                self.f_until(lambda: time.monotonic() >= end, duration+3., 'one complete smooth circle')
+                selected = self.f_reference()
+                if selected is None:
+                    raise RuntimeError('Missing circle reference at completion')
+                self.f_settle(np.array(selected[0].position))
         elif mode == 'hover_to_hover':
             self.set_trajectory(mode, origin, self.f_yaw)
             dist = float(np.linalg.norm(self.config['offset']))
@@ -456,8 +520,8 @@ class Flight(ReferencePublisher):
         metrics = self.f_metrics(mode)
         if metrics['position_error_max'] is None or metrics['position_error_max'] > 1.:
             raise RuntimeError(f'{mode}: maximum tracking error exceeds 1 m')
-        if mode in ('constant_velocity', 'circle', 'hover_to_hover'):
-            if metrics['position_error_rmse'] > .35 or metrics['velocity_error_rmse'] > .3:
+        if mode in ('constant_velocity', 'circle', 'figure8', 'helix', 'hover_to_hover'):
+            if metrics['position_error_rmse'] > self.f_max_pos_rmse or metrics['velocity_error_rmse'] > self.f_max_vel_rmse:
                 raise RuntimeError(f'{mode}: moving tracking RMSE exceeds position/velocity limits')
         self.f_phase_done()
 
@@ -534,9 +598,11 @@ class Flight(ReferencePublisher):
         saved_offset = np.asarray(self.config['offset'], dtype=float).copy()
         saved_speed = float(self.config['speed'])
         saved_delay = float(self.config['start_delay'])
+        saved_loops = self.config.get('loops')
         self.config['offset'] = np.array([0., 0., -2.])
         self.config['speed'] = 0.4
         self.config['start_delay'] = 0.5
+        self.config['loops'] = None
         self.set_trajectory('hover_to_hover', self.f_ground, self.f_yaw)
         takeoff_duration = self.config['start_delay'] + (35.0/16.0)*2.0/0.4
         end = time.monotonic()+takeoff_duration+.5
@@ -544,6 +610,7 @@ class Flight(ReferencePublisher):
         self.config['offset'] = saved_offset
         self.config['speed'] = saved_speed
         self.config['start_delay'] = saved_delay
+        self.config['loops'] = saved_loops
         self.f_settle(airborne)
         self.f_phase_done()
         for mode in self.f_modes:
@@ -565,11 +632,56 @@ class Flight(ReferencePublisher):
             result[prefix+'_max'] = max(values, default=None)
         for field in ('speed_m_s', 'tilt_rad', 'yaw_error_rad'):
             result[field+'_max'] = max((r[field] for r in rows), default=None)
+        ref_speeds = [math.sqrt(r['ref_vn_m_s']**2 + r['ref_ve_m_s']**2 + r['ref_vd_m_s']**2)
+                      for r in rows if all(math.isfinite(r[k]) for k in ('ref_vn_m_s', 'ref_ve_m_s', 'ref_vd_m_s'))]
+        result['ref_speed_m_s_max'] = max(ref_speeds, default=None)
         for field in ('input_thrust_m_s2', 'input_roll_rad_s', 'input_pitch_rad_s',
                       'input_yaw_rad_s', 'bridge_roll_rad_s', 'bridge_pitch_rad_s',
                       'bridge_yaw_rad_s', 'bridge_thrust_z'):
             values = [abs(r[field]) for r in rows if math.isfinite(r[field])]
             result[field+'_abs_max'] = max(values, default=None)
+        thrust_vals = [r['input_thrust_m_s2'] for r in rows if math.isfinite(r['input_thrust_m_s2'])]
+        result['input_thrust_m_s2_min'] = min(thrust_vals, default=None)
+        result['input_thrust_m_s2_max'] = max(thrust_vals, default=None)
+        # Moving-only tracking, along/cross-track decomposition, and optimal phase lag
+        result['moving_only_position_rmse'] = None
+        result['along_track_lag_m_mean'] = None
+        result['along_track_error_rmse'] = None
+        result['cross_track_error_rmse'] = None
+        result['tracking_lag_ms'] = None
+        result['lag_compensated_position_rmse'] = None
+        if len(rows) >= 10:
+            t_arr = np.array([r['time_s'] for r in rows], dtype=float)
+            p_arr = np.array([[r['north_m'], r['east_m'], r['down_m']] for r in rows], dtype=float)
+            pr_arr = np.array([[r['ref_n_m'], r['ref_e_m'], r['ref_d_m']] for r in rows], dtype=float)
+            vr_arr = np.array([[r['ref_vn_m_s'], r['ref_ve_m_s'], r['ref_vd_m_s']] for r in rows], dtype=float)
+            vr_norm = np.linalg.norm(vr_arr, axis=1)
+            moving = vr_norm > 0.05
+            if int(np.sum(moving)) >= 10 and (t_arr[-1] - t_arr[0]) > 0.5:
+                p_mov = p_arr[moving]
+                pr_mov = pr_arr[moving]
+                vr_mov = vr_arr[moving]
+                vn_mov = vr_norm[moving]
+                t_mov = t_arr[moving]
+                err_vec = pr_mov - p_mov  # positive along velocity => actual lags behind reference
+                t_hat = vr_mov / vn_mov[:, None]
+                along = np.sum(err_vec * t_hat, axis=1)
+                cross_vec = err_vec - along[:, None] * t_hat
+                result['moving_only_position_rmse'] = float(np.sqrt(np.mean(np.sum(err_vec**2, axis=1))))
+                result['along_track_lag_m_mean'] = float(np.mean(along))
+                result['along_track_error_rmse'] = float(np.sqrt(np.mean(along**2)))
+                result['cross_track_error_rmse'] = float(np.sqrt(np.mean(np.sum(cross_vec**2, axis=1))))
+                shifts = np.linspace(-0.35, 0.35, 701)
+                best_dt = 0.0
+                best_rmse = math.inf
+                for dt in shifts:
+                    shifted = np.column_stack([np.interp(t_mov - dt, t_arr, pr_arr[:, ax]) for ax in range(3)])
+                    rmse = float(np.sqrt(np.mean(np.sum((p_mov - shifted)**2, axis=1))))
+                    if rmse < best_rmse:
+                        best_rmse = rmse
+                        best_dt = float(dt)
+                result['tracking_lag_ms'] = best_dt * 1000.0
+                result['lag_compensated_position_rmse'] = best_rmse
         for kind in ('control', 'rates'):
             observations = [e for e in events if e['kind'] == kind]
             gaps = [e['gap_s'] for e in observations if math.isfinite(e['gap_s'])]
@@ -577,16 +689,50 @@ class Flight(ReferencePublisher):
             result[kind+'_max_gap_s'] = max(gaps, default=None)
             result[kind+'_gaps_over_0_1s'] = sum(g > .1 for g in gaps)
             result[kind+'_bound_violations'] = sum(not e['bounds_valid'] for e in observations)
+        # Controller solve timing metrics from /tmp/ommpc_solve_trace.csv
+        if phase is not None and phase in self.f_phase_info:
+            start_steady = self.f_started + self.f_phase_info[phase]['start_s']
+            end_steady = self.f_started + self.f_phase_info[phase].get('end_s', self.f_time())
+            solves = [s for s in self.f_solve_rows if start_steady <= s['steady_s'] <= end_steady]
+        else:
+            start_steady = self.f_started
+            end_steady = self.f_started + self.f_time()
+            solves = [s for s in self.f_solve_rows if start_steady <= s['steady_s'] <= end_steady]
+        if solves:
+            solve_ms = np.array([s['solve_us'] * 1e-3 for s in solves], dtype=float)
+            step_ms = np.array([s['step_us'] * 1e-3 for s in solves], dtype=float)
+            iters = np.array([s['iterations'] for s in solves], dtype=float)
+            result['solve_samples'] = len(solves)
+            result['solve_time_ms_mean'] = float(np.mean(solve_ms))
+            result['solve_time_ms_p95'] = float(np.percentile(solve_ms, 95))
+            result['solve_time_ms_max'] = float(np.max(solve_ms))
+            result['step_time_ms_mean'] = float(np.mean(step_ms))
+            result['step_time_ms_p95'] = float(np.percentile(step_ms, 95))
+            result['step_time_ms_max'] = float(np.max(step_ms))
+            result['osqp_iterations_mean'] = float(np.mean(iters))
+            result['osqp_iterations_max'] = int(np.max(iters))
+        else:
+            result['solve_samples'] = 0
+            result['solve_time_ms_mean'] = None
+            result['solve_time_ms_p95'] = None
+            result['solve_time_ms_max'] = None
+            result['step_time_ms_mean'] = None
+            result['step_time_ms_p95'] = None
+            result['step_time_ms_max'] = None
+            result['osqp_iterations_mean'] = None
+            result['osqp_iterations_max'] = None
         if phase is not None:
-            result.update(self.f_phase_info[phase])
-            counts_end = result.pop('counts_end', self.f_counts)
-            counts_start = result.pop('counts_start')
+            info = self.f_phase_info[phase].copy()
+            counts_end = info.pop('counts_end', self.f_counts)
+            counts_start = info.pop('counts_start')
+            result.update(info)
             result['fresh_telemetry_counts'] = {k: counts_end[k]-counts_start[k] for k in self.f_counts}
         return finite_or_none(result)
 
     def f_save(self):
         if self.f_phase in self.f_phase_info:
             self.f_phase_info[self.f_phase].setdefault('end_s', self.f_time())
+        self.f_solve_rows = load_solve_trace()
         phases = {}
         for name in self.f_phase_info:
             metric = self.f_metrics(name)
@@ -596,6 +742,15 @@ class Flight(ReferencePublisher):
                 writer = csv.DictWriter(file, TRACE_FIELDS)
                 writer.writeheader()
                 writer.writerows(r for r in self.f_rows if r['phase'] == name)
+        if self.f_solve_rows:
+            start_steady = self.f_started
+            end_steady = self.f_started + self.f_time()
+            run_solves = [s for s in self.f_solve_rows if start_steady <= s['steady_s'] <= end_steady]
+            if run_solves:
+                with (self.f_out/'solve_timing.csv').open('w', newline='') as file:
+                    writer = csv.DictWriter(file, ['steady_s', 'solve_us', 'step_us', 'iterations', 'status', 'solver_status'])
+                    writer.writeheader()
+                    writer.writerows(run_solves)
         self.f_result.update({'duration_s': self.f_time(), 'last_phase': self.f_phase,
                               'takeoff_height_max_m': self.f_max_height,
                               'topic_counts': self.f_counts, 'commands': self.f_commands,
@@ -648,14 +803,22 @@ def main():
                         help='Override maximum allowed thrust acceleration in m/s^2')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--mode', choices=MODES, help='Run one mode after takeoff')
-    selection.add_argument('--modes', choices=MODES, nargs='+', help='Run selected modes in sequence (default: all five)')
+    selection.add_argument('--modes', choices=MODES, nargs='+', help='Run selected modes in sequence (default: original five)')
     parser.add_argument('--output-dir', type=Path,
                         help='New directory; must not exist. Default: timestamped under ~/uav_control_ws/ommpc-flight-results')
     parser.add_argument('--record-bag', action='store_true', help='Record essential reference/state/status/control/PX4 topics')
-    parser.add_argument('--speed', type=float, default=None, help='Target speed for moving modes (e.g. hover_to_hover)')
+    parser.add_argument('--speed', type=float, default=None, help='Target speed for moving modes')
     parser.add_argument('--offset', type=float, nargs=3, default=None, help='Displacement offset N E D for target_step/hover_to_hover')
+    parser.add_argument('--radius', type=float, default=None, help='Radius (m) for circle/figure8/helix')
+    parser.add_argument('--z-amp', type=float, default=None, help='Vertical amplitude (m) for 3D helix')
+    parser.add_argument('--loops', type=float, default=None, help='Number of periods for periodic curves')
+    parser.add_argument('--ramp', type=float, default=None, help='Ramp duration (s) for line/curve modes')
+    parser.add_argument('--abort-tilt', type=float, default=0.6, help='Abort tilt threshold in radians (default: 0.6)')
+    parser.add_argument('--max-pos-rmse', type=float, default=0.35, help='Moving phase position RMSE threshold (m)')
+    parser.add_argument('--max-vel-rmse', type=float, default=0.30, help='Moving phase velocity RMSE threshold (m/s)')
     args = parser.parse_args()
-    modes = [args.mode] if args.mode else (args.modes or list(MODES))
+    default_modes = ['hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover']
+    modes = [args.mode] if args.mode else (args.modes or default_modes)
     if len(modes) != len(set(modes)):
         parser.error('Each mode may appear only once')
     out = (args.output_dir or Path.home()/'uav_control_ws/ommpc-flight-results'/
@@ -665,11 +828,23 @@ def main():
     flight = None
     bag = bag_log = None
     try:
-        flight = Flight(out, modes, vehicle=args.vehicle, max_thrust=args.max_thrust)
+        flight = Flight(out, modes, vehicle=args.vehicle, max_thrust=args.max_thrust,
+                        abort_tilt_rad=args.abort_tilt, max_pos_rmse=args.max_pos_rmse,
+                        max_vel_rmse=args.max_vel_rmse, speed_override=args.speed,
+                        radius_override=args.radius, z_amp_override=args.z_amp,
+                        loops_override=args.loops, ramp_override=args.ramp)
         if args.speed is not None:
             flight.config['speed'] = float(args.speed)
         if args.offset is not None:
             flight.config['offset'] = np.array(args.offset, dtype=float)
+        if args.radius is not None:
+            flight.config['radius'] = float(args.radius)
+        if args.z_amp is not None:
+            flight.config['z_amp'] = float(args.z_amp)
+        if args.loops is not None:
+            flight.config['loops'] = float(args.loops)
+        if args.ramp is not None:
+            flight.config['ramp'] = float(args.ramp)
         if args.record_bag:
             bag, bag_log = start_bag(out)
             flight.f_until(lambda: (out/'bag').is_dir() or bag.poll() is not None, 10., 'rosbag recorder startup')

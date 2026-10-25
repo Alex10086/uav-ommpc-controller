@@ -2,6 +2,8 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -38,6 +40,17 @@ public:
     odometry_timeout_ = timeout_parameter("odometry_timeout", 0.2);
     status_timeout_ = timeout_parameter("status_timeout", 1.5);
     reference_timeout_ = timeout_parameter("reference_timeout", 0.5);
+    const auto trace_path = parameter<std::string>("solve_trace_path", "/tmp/ommpc_solve_trace.csv");
+    if (!trace_path.empty())
+    {
+      solve_trace_.open(trace_path, std::ios::out | std::ios::trunc);
+      if (solve_trace_.is_open())
+      {
+        solve_trace_ << "steady_s,solve_us,step_us,iterations,status,solver_status\n";
+        solve_trace_ << std::fixed << std::setprecision(6);
+        solve_trace_.flush();
+      }
+    }
     controller_ = std::make_unique<mpc::Controller>(settings_);
     period_ = std::chrono::nanoseconds(std::llround(settings_.dt * 1e9));
     reference_states_.resize(settings_.horizon + 1);
@@ -197,6 +210,24 @@ private:
     return anchor_elapsed;
   }
 
+  void record_solve_timing(
+    Clock::time_point started,
+    Clock::time_point solve_started,
+    Clock::time_point solve_finished,
+    Clock::time_point finished,
+    const mpc::Result &result)
+  {
+    if (!solve_trace_.is_open()) return;
+    const double steady_s = std::chrono::duration<double>(finished.time_since_epoch()).count();
+    const double solve_us = std::chrono::duration<double, std::micro>(solve_finished - solve_started).count();
+    const double step_us = std::chrono::duration<double, std::micro>(finished - started).count();
+    solve_trace_ << steady_s << ',' << solve_us << ',' << step_us << ','
+                 << result.iterations << ',' << static_cast<int>(result.status) << ','
+                 << result.solver_status << '\n';
+    if (++solve_count_ % 5 == 0 || result.status != mpc::Status::Solved)
+      solve_trace_.flush();
+  }
+
   void control_step()
   {
     const auto started = Clock::now();
@@ -213,15 +244,19 @@ private:
         "Control paused: polynomial cannot supply a valid full reference horizon");
       return;
     }
+    const auto solve_started = Clock::now();
     const auto result = controller_->solve(actual_, reference_states_, reference_inputs_);
+    const auto solve_finished = Clock::now();
     if (result.status != mpc::Status::Solved || !result.command)
     {
+      record_solve_timing(started, solve_started, solve_finished, solve_finished, result);
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
         "OMMPC produced no command: status=%d, OSQP=%d, iterations=%d",
         static_cast<int>(result.status), result.solver_status, result.iterations);
       return;
     }
     const auto finished = Clock::now();
+    record_solve_timing(started, solve_started, solve_finished, finished, result);
     // Ordinary reference sample boundary crossings are allowed. Bound solve
     // latency and recheck the lease/telemetry/domain, not a floor-grid index.
     if (finished - started > period_ ||
@@ -239,6 +274,8 @@ private:
   std::unique_ptr<mpc::Controller> controller_;
   std::chrono::nanoseconds period_{};
   double odometry_timeout_{}, status_timeout_{}, reference_timeout_{};
+  std::ofstream solve_trace_;
+  std::uint64_t solve_count_{};
   dynamics::State actual_;
   std::vector<dynamics::State> reference_states_;
   std::vector<dynamics::ControlInput> reference_inputs_;

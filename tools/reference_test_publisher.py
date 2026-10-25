@@ -2,11 +2,13 @@
 """Publish analytic NED polynomial plans only; never arm or change flight modes.
 
 target_step replaces the entire hover target after start_delay; no polynomial
-contains a teleport. Lines ramp, cruise, brake and hold. Circles ramp their
-angular speed and continue indefinitely using overlapping C3 Hermite windows.
-All modes preserve initial yaw. Repeated plans retain their ROS start stamp;
-publication refreshes the controller's receipt lease, not the trajectory clock.
-Source the ROS/project overlays before running, including with --check.
+contains a teleport. Lines ramp, cruise, brake and hold. Circles, figure-8 and
+3D helix trajectories ramp their angular speed and either continue indefinitely
+or smoothly brake after a configured number of loops using overlapping C3
+Hermite windows. All modes preserve initial yaw. Repeated plans retain their
+ROS start stamp; publication refreshes the controller's receipt lease, not the
+trajectory clock. Source the ROS/project overlays before running, including
+with --check.
 """
 import argparse
 import math
@@ -21,8 +23,11 @@ from px4_msgs.msg import VehicleOdometry
 from uav_ommpc_interfaces.msg import PolynomialSegment, PolynomialTrajectory
 
 G = 9.80665
-MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'hover_to_hover')
+MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'figure8', 'helix', 'hover_to_hover')
 RATE_LIMITS = np.array([3.0, 3.0, 1.5])
+MAX_SPEED = 4.0
+MAX_ACCELERATION = 8.0
+MAX_JERK = 20.0
 VEHICLES = {
     'x500': {
         'max_thrust': 12.0,
@@ -197,9 +202,10 @@ def ramp_integral(value):
 class Trajectory:
     """Analytic geometry and cached, overlapping polynomial publication windows."""
     def __init__(self, mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
-                 rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
+                 rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6, z_amp=.35, loops=None,
                  start_delay=2., ramp=3., line_duration=8., direction=(1., 0., 0.),
-                 max_thrust=12.):
+                 max_thrust=12., max_speed=MAX_SPEED, max_acceleration=MAX_ACCELERATION,
+                 max_jerk=MAX_JERK):
         if mode not in MODES:
             raise ValueError(f'mode must be one of {MODES}')
         self.mode = mode
@@ -209,8 +215,9 @@ class Trajectory:
             raise ValueError('yaw must be finite')
         for name, value in (('window', window), ('segment_duration', segment_duration),
                             ('rate', rate), ('speed', speed), ('radius', radius),
-                            ('ramp', ramp), ('line_duration', line_duration),
-                            ('max_thrust', max_thrust)):
+                            ('z_amp', z_amp), ('ramp', ramp), ('line_duration', line_duration),
+                            ('max_thrust', max_thrust), ('max_speed', max_speed),
+                            ('max_acceleration', max_acceleration), ('max_jerk', max_jerk)):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{name} must be finite and positive')
             setattr(self, name, float(value))
@@ -218,6 +225,12 @@ class Trajectory:
             raise ValueError('max_thrust must exceed gravity')
         if not math.isfinite(start_delay) or start_delay < 0.0:
             raise ValueError('start_delay must be finite and nonnegative')
+        if loops is not None:
+            if not math.isfinite(loops) or loops <= 0.0:
+                raise ValueError('loops must be finite and positive')
+            self.loops = float(loops)
+        else:
+            self.loops = None
         if window < 2. or segment_duration < .05 or segment_duration > window/2.:
             raise ValueError('window must be >=2 s and segment_duration in [.05, window/2]')
         if math.ceil(window/segment_duration)+5 > 100:
@@ -230,6 +243,42 @@ class Trajectory:
         if not math.isfinite(length) or length < 1e-12:
             raise ValueError('direction must have a finite nonzero norm')
         self.direction /= length
+
+    def _curve_omega(self):
+        if self.mode == 'circle':
+            return self.speed / self.radius
+        if self.mode == 'figure8':
+            return self.speed / (math.sqrt(2.0) * self.radius)
+        if self.mode == 'helix':
+            return self.speed / math.sqrt(self.radius**2 + 4.0 * self.z_amp**2)
+        return 0.0
+
+    def _curve_cruise_duration(self):
+        if self.loops is None:
+            return None
+        omega = self._curve_omega()
+        total_tau = (2.0 * math.pi * self.loops) / omega
+        if total_tau <= self.ramp:
+            raise ValueError('loops are too short for the configured ramp duration')
+        return total_tau - self.ramp
+
+    def _angular_progress(self, travel):
+        omega = self._curve_omega()
+        u = min(travel / self.ramp, 1.)
+        smooth = u**3 * (10. + u * (-15. + 6. * u))
+        smooth_dot = 30. * u**2 * (1. - u)**2 / self.ramp
+        smooth_ddot = 60. * u * (1. - u) * (1. - 2. * u) / self.ramp**2
+        integral = self.ramp * ramp_integral(u)
+        cruise = self._curve_cruise_duration()
+        if cruise is None or travel < self.ramp + cruise:
+            tau = integral if travel < self.ramp else travel - 0.5 * self.ramp
+            return omega * tau, omega * smooth, omega * smooth_dot, omega * smooth_ddot
+        b = min((travel - self.ramp - cruise) / self.ramp, 1.)
+        tau = 0.5 * self.ramp + cruise + self.ramp * (b - ramp_integral(b))
+        tau_d1 = 1. - b**3 * (10. + b * (-15. + 6. * b))
+        tau_d2 = -30. * b**2 * (1. - b)**2 / self.ramp
+        tau_d3 = -60. * b * (1. - b) * (1. - 2. * b) / self.ramp**2
+        return omega * tau, omega * tau_d1, omega * tau_d2, omega * tau_d3
 
     def flat(self, elapsed):
         """Exact underlying trajectory and derivatives, before polynomial fitting."""
@@ -254,15 +303,33 @@ class Trajectory:
             return FlatSample(self.origin+distance*axis, velocity*axis,
                               acceleration*axis, jerk*axis, self.yaw, 0.)
         if self.mode == 'circle':
-            omega = self.speed/self.radius
-            theta = omega*(integral if travel < self.ramp else travel-.5*self.ramp)
-            w, alpha, beta = omega*smooth, omega*smooth_dot, omega*smooth_ddot
+            theta, w, alpha, beta = self._angular_progress(travel)
             tangent = np.array([math.cos(theta), math.sin(theta), 0.])
             normal = np.array([-math.sin(theta), math.cos(theta), 0.])
             p = self.origin+self.radius*np.array([math.sin(theta), 1.-math.cos(theta), 0.])
             return FlatSample(p, self.radius*w*tangent,
                               self.radius*(alpha*tangent+w*w*normal),
                               self.radius*((beta-w**3)*tangent+3.*w*alpha*normal), self.yaw, 0.)
+        if self.mode == 'figure8':
+            theta, w, alpha, beta = self._angular_progress(travel)
+            s1, c1 = math.sin(theta), math.cos(theta)
+            s2, c2 = math.sin(2.0*theta), math.cos(2.0*theta)
+            p = self.origin + self.radius * np.array([s1, 0.5*s2, 0.0])
+            dp = self.radius * np.array([c1, c2, 0.0])
+            ddp = self.radius * np.array([-s1, -2.0*s2, 0.0])
+            dddp = self.radius * np.array([-c1, -4.0*c2, 0.0])
+            return FlatSample(p, dp*w, ddp*(w*w) + dp*alpha,
+                              dddp*(w**3) + 3.0*ddp*w*alpha + dp*beta, self.yaw, 0.)
+        if self.mode == 'helix':
+            theta, w, alpha, beta = self._angular_progress(travel)
+            s1, c1 = math.sin(theta), math.cos(theta)
+            s2, c2 = math.sin(2.0*theta), math.cos(2.0*theta)
+            p = self.origin + np.array([self.radius*s1, self.radius*(1.0-c1), -self.z_amp*s2])
+            dp = np.array([self.radius*c1, self.radius*s1, -2.0*self.z_amp*c2])
+            ddp = np.array([-self.radius*s1, self.radius*c1, 4.0*self.z_amp*s2])
+            dddp = np.array([-self.radius*c1, -self.radius*s1, 8.0*self.z_amp*c2])
+            return FlatSample(p, dp*w, ddp*(w*w) + dp*alpha,
+                              dddp*(w**3) + 3.0*ddp*w*alpha + dp*beta, self.yaw, 0.)
         if self.mode == 'hover_to_hover':
             travel = max(elapsed-self.start_delay, 0.)
             dist = float(np.linalg.norm(self.offset))
@@ -318,14 +385,22 @@ class Trajectory:
                          if anchor < k*self.segment_duration < end)
             if self.mode == 'constant_velocity':
                 boundaries = [self.start_delay, self.start_delay+self.ramp,
-                               self.start_delay+self.ramp+self.line_duration,
-                               self.start_delay+2.*self.ramp+self.line_duration]
+                              self.start_delay+self.ramp+self.line_duration,
+                              self.start_delay+2.*self.ramp+self.line_duration]
             elif self.mode == 'hover_to_hover':
                 dist = float(np.linalg.norm(self.offset))
-                duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
+                duration = (35.0/16.0)*dist/self.speed
                 boundaries = [self.start_delay, self.start_delay+duration]
+            elif self.mode in ('circle', 'figure8', 'helix') and self.loops is not None:
+                cruise = self._curve_cruise_duration()
+                boundaries = [self.start_delay, self.start_delay+self.ramp,
+                              self.start_delay+self.ramp+cruise,
+                              self.start_delay+2.*self.ramp+cruise]
             else:
                 boundaries = [self.start_delay, self.start_delay+self.ramp]
+            for b in boundaries:
+                if anchor < b < end and min(abs(b - k) for k in knots) > 0.02:
+                    knots.append(b)
             ordered = sorted(set(knots))
             knots = [ordered[0]]
             for knot in ordered[1:]:
@@ -348,7 +423,11 @@ class Trajectory:
                 dist = float(np.linalg.norm(self.offset))
                 duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
                 msg.hold_final = end >= self.start_delay+duration
-        check_message(msg, max_thrust=self.max_thrust)
+            elif self.mode in ('circle', 'figure8', 'helix') and self.loops is not None:
+                cruise = self._curve_cruise_duration()
+                msg.hold_final = end >= self.start_delay+2.*self.ramp+cruise
+        check_message(msg, max_thrust=self.max_thrust, max_speed=self.max_speed,
+                      max_acceleration=self.max_acceleration, max_jerk=self.max_jerk)
         self._cached_key, self._cached_message = key, msg
         return msg
 
@@ -356,13 +435,15 @@ class Trajectory:
 class ReferencePublisher(Node):
     """Reference-only node; unspecified origin/yaw wait for valid NED odometry."""
     def __init__(self, *, mode='hover', origin=None, yaw=None, window=4., segment_duration=.5,
-                 rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6,
+                 rate=25., offset=(.6, .3, 0.), speed=.3, radius=.6, z_amp=.35, loops=None,
                  start_delay=2., ramp=3., line_duration=8., direction=(1., 0., 0.),
-                 max_thrust=12., node_name='reference_test_publisher'):
+                 max_thrust=12., max_speed=MAX_SPEED, max_acceleration=MAX_ACCELERATION,
+                 max_jerk=MAX_JERK, node_name='reference_test_publisher'):
         self.config = dict(window=window, segment_duration=segment_duration, rate=rate, offset=offset,
-                           speed=speed, radius=radius, start_delay=start_delay,
+                           speed=speed, radius=radius, z_amp=z_amp, loops=loops, start_delay=start_delay,
                            ramp=ramp, line_duration=line_duration, direction=direction,
-                           max_thrust=max_thrust)
+                           max_thrust=max_thrust, max_speed=max_speed,
+                           max_acceleration=max_acceleration, max_jerk=max_jerk)
         Trajectory(mode=mode, origin=origin, yaw=yaw, **self.config)
         super().__init__(node_name)
         self.publish_enabled = True
@@ -423,7 +504,8 @@ class ReferencePublisher(Node):
             self.get_logger().error(f'Reference generation failed; publishing STOPPED: {exc}')
 
 
-def check_message(msg, max_thrust=12.):
+def check_message(msg, max_thrust=12., max_speed=MAX_SPEED,
+                  max_acceleration=MAX_ACCELERATION, max_jerk=MAX_JERK):
     """Check C3/C1 knots, stationary hold and sampled analytic physical bounds.
 
     This diagnostic is not a proof of between-sample actuator feasibility; the
@@ -432,6 +514,9 @@ def check_message(msg, max_thrust=12.):
     """
     if not math.isfinite(max_thrust) or max_thrust <= G:
         raise ValueError('max_thrust must be finite and exceed gravity')
+    for name, val in (('max_speed', max_speed), ('max_acceleration', max_acceleration), ('max_jerk', max_jerk)):
+        if not math.isfinite(val) or val <= 0.:
+            raise ValueError(f'{name} must be finite and positive')
     if msg.header.frame_id != 'ned' or not 1 <= len(msg.segments) <= 100:
         raise ValueError('invalid polynomial frame or segment count')
     previous = None
@@ -447,14 +532,66 @@ def check_message(msg, max_thrust=12.):
             for name in ('position', 'velocity', 'acceleration', 'jerk', 'yaw', 'yaw_rate'):
                 if np.linalg.norm(np.asarray(getattr(left, name))-getattr(previous, name)) > 1e-6:
                     raise ValueError(f'discontinuous polynomial {name}')
-        for t in np.linspace(0., segment.duration, max(2, math.ceil(segment.duration/.05)+1)):
-            ref = flat_reference(evaluate_segment(segment, t))
-            if not 1. <= ref.thrust_acceleration <= max_thrust:
-                raise ValueError(f'generated thrust exceeds [1, {max_thrust:g}] m/s^2')
-            if np.any(np.abs(ref.body_rates) > RATE_LIMITS):
-                raise ValueError('generated body rates exceed [3, 3, 1.5] rad/s')
-            maxima = np.maximum(maxima, [ref.thrust_acceleration, *np.abs(ref.body_rates)])
-        previous = evaluate_segment(segment, segment.duration)
+        n_pts = max(2, math.ceil(segment.duration/.05)+1)
+        s_vec = np.linspace(0., 1., n_pts)
+        inv_d = 1.0 / segment.duration
+        inv_d2 = inv_d * inv_d
+        inv_d3 = inv_d2 * inv_d
+        pos = np.empty((n_pts, 3))
+        vel = np.empty((n_pts, 3))
+        acc = np.empty((n_pts, 3))
+        jrk = np.empty((n_pts, 3))
+        for ax, coeffs in enumerate((segment.x, segment.y, segment.z)):
+            d0 = d1 = d2 = d3 = 0.0
+            for c in reversed(coeffs):
+                d3 = d3 * s_vec + 3.0 * d2
+                d2 = d2 * s_vec + 2.0 * d1
+                d1 = d1 * s_vec + d0
+                d0 = d0 * s_vec + c
+            pos[:, ax] = d0
+            vel[:, ax] = d1 * inv_d
+            acc[:, ax] = d2 * inv_d2
+            jrk[:, ax] = d3 * inv_d3
+        w0 = w1 = 0.0
+        for c in reversed(segment.yaw):
+            w1 = w1 * s_vec + w0
+            w0 = w0 * s_vec + c
+        yaw_vec = w0
+        yaw_rate_vec = w1 * inv_d
+        if np.max(np.linalg.norm(vel, axis=1)) > max_speed + 1e-5:
+            raise ValueError(f'generated speed exceeds {max_speed:g} m/s')
+        if np.max(np.linalg.norm(acc, axis=1)) > max_acceleration + 1e-5:
+            raise ValueError(f'generated acceleration exceeds {max_acceleration:g} m/s^2')
+        if np.max(np.linalg.norm(jrk, axis=1)) > max_jerk + 1e-4:
+            raise ValueError(f'generated jerk exceeds {max_jerk:g} m/s^3')
+        force = np.array([0., 0., G]) - acc
+        thrust = np.linalg.norm(force, axis=1)
+        if not np.all(np.isfinite(thrust)) or np.any(thrust <= 1e-6):
+            raise ValueError('undefined thrust direction')
+        b3 = force / thrust[:, None]
+        if np.any(b3[:, 2] <= 1e-3):
+            raise ValueError('reference is not upright')
+        b3_dot = (-jrk + b3 * np.sum(b3 * jrk, axis=1)[:, None]) / thrust[:, None]
+        ypsi = np.column_stack((-np.sin(yaw_vec), np.cos(yaw_vec), np.zeros(n_pts)))
+        ypsi_dot = yaw_rate_vec[:, None] * np.column_stack((-np.cos(yaw_vec), -np.sin(yaw_vec), np.zeros(n_pts)))
+        h = np.cross(ypsi, b3)
+        h_norm = np.linalg.norm(h, axis=1)
+        if not np.all(np.isfinite(h_norm)) or np.any(h_norm <= 1e-6):
+            raise ValueError('singular yaw/thrust frame')
+        b1 = h / h_norm[:, None]
+        h_dot = np.cross(ypsi_dot, b3) + np.cross(ypsi, b3_dot)
+        b1_dot = (h_dot - b1 * np.sum(b1 * h_dot, axis=1)[:, None]) / h_norm[:, None]
+        b2 = np.cross(b3, b1)
+        b2_dot = np.cross(b3_dot, b1) + np.cross(b3, b1_dot)
+        rates = np.column_stack((np.sum(b2_dot * b3, axis=1), np.sum(b3_dot * b1, axis=1), np.sum(b1_dot * b2, axis=1)))
+        if not np.all(np.isfinite(rates)) or not np.all(np.isfinite(pos)) or not np.all(np.isfinite(vel)):
+            raise ValueError('nonfinite generated reference')
+        if np.any(thrust < 1.) or np.any(thrust > max_thrust):
+            raise ValueError(f'generated thrust exceeds [1, {max_thrust:g}] m/s^2')
+        if np.any(np.abs(rates) > RATE_LIMITS):
+            raise ValueError('generated body rates exceed [3, 3, 1.5] rad/s')
+        maxima = np.maximum(maxima, [np.max(thrust), *np.max(np.abs(rates), axis=0)])
+        previous = FlatSample(pos[-1], vel[-1], acc[-1], jrk[-1], float(yaw_vec[-1]), float(yaw_rate_vec[-1]))
     if msg.hold_final and any(np.linalg.norm(getattr(previous, name)) > 1e-6
                              for name in ('velocity', 'acceleration', 'jerk', 'yaw_rate')):
         raise ValueError('hold_final requires a stationary endpoint')
@@ -476,6 +613,8 @@ def parser():
     cli.add_argument('--offset', nargs=3, type=float, default=(.6, .3, 0.), metavar=('N', 'E', 'D'), help='target_step equilibrium displacement; whole horizon switches after start-delay')
     cli.add_argument('--speed', type=float, default=.3)
     cli.add_argument('--radius', type=float, default=.6)
+    cli.add_argument('--z-amp', type=float, default=.35, help='Vertical amplitude (m) for 3D helix mode')
+    cli.add_argument('--loops', type=float, default=None, help='Optional number of 2*pi periods before smooth braking on periodic curves')
     cli.add_argument('--start-delay', type=float, default=2.)
     cli.add_argument('--ramp', type=float, default=3.)
     cli.add_argument('--line-duration', type=float, default=8., help='Constant-speed cruise duration, excluding ramps')
@@ -503,8 +642,11 @@ def main():
                 end = duration
             elif args.mode == 'constant_velocity':
                 end = trajectory.start_delay+2*trajectory.ramp+trajectory.line_duration
-            elif args.mode == 'circle':
-                end = trajectory.start_delay+trajectory.ramp+2*math.pi*trajectory.radius/trajectory.speed
+            elif args.mode in ('circle', 'figure8', 'helix'):
+                if trajectory.loops is not None:
+                    end = trajectory.start_delay + 2*trajectory.ramp + trajectory._curve_cruise_duration()
+                else:
+                    end = trajectory.start_delay + trajectory.ramp + 2*math.pi/trajectory._curve_omega()
             else:
                 end = trajectory.start_delay+trajectory.window
             for elapsed in np.arange(0., end+trajectory.segment_duration, trajectory.segment_duration):

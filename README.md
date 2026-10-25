@@ -792,6 +792,25 @@ Observed `gz_super` SITL verification (`~/uav_control_ws/ommpc-flight-results/su
 | Hover (`5 s` settled) | 0.0368 | 0.0470 | 0.0137 | 0.0034 | 0.3090 | 0 |
 | `hover_to_hover` (`0.8 m/s`) | 0.0508 | 0.1142 | 0.0464 | 0.1917 | 0.3131 | 0 |
 
+#### SUPER 3x3 speed scan, complex trajectories, Q/R/horizon tuning, and bottleneck diagnosis
+
+All trajectories enforce kinematic bounds v <= 4.0 m/s, a <= 8.0 m/s², j <= 20.0 m/s³, and support circle, figure8 (Lissajous figure-8), helix (3D wave orbit) and hover_to_hover. Baseline parameters (uav_ommpc_ros/config/ommpc_super_orig.yaml, N=30) were compared against the SUPER-tuned configuration (uav_ommpc_ros/config/ommpc_super_sitl.yaml, N=20, state_weights=[300,300,400, 85,85,80, 80,80,60], terminal_weights=[4500,4500,6000, 255,255,240, 160,160,120], input_weights=[1.2, 10, 10, 4]):
+
+| Trajectory & speed | Baseline RMSE (m) | Tuned RMSE (m) | Baseline max error (m) | Tuned max error (m) | Tuned lag (ms) | Tuned max tilt (rad) | Tuned solve mean (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| hover_to_hover 0.8 m/s (n=3) | 0.0642 ± 0.0081 | **0.0351 ± 0.0021** | 0.1633 | **0.0776** | +4.0 | 0.0578 | 1.24 |
+| hover_to_hover 1.6 m/s (n=3) | 0.0998 ± 0.0025 | **0.0528 ± 0.0022** | 0.2624 | **0.1464** | -30.7 | 0.2064 | 1.26 |
+| hover_to_hover 2.0 m/s (n=3) | 0.1188 ± 0.0097 | **0.0637 ± 0.0015** | 0.3090 | **0.1762** | -49.3 | 0.3387 | 1.22 |
+| hover_to_hover 4.0 m/s (4.5 m) | 0.2055 | **0.1301** | 0.5536 | **0.3792** | -41.0 | 0.5354 | 1.21 |
+| circle 1.6 / 2.0 / 3.0 / 4.0 m/s | 0.135 / 0.127 / 0.190 / 0.229 | **0.055 / 0.057 / 0.079 / 0.107** | 0.319 / 0.233 / 0.349 / 0.399 | **0.126 / 0.102 / 0.135 / 0.198** | +18 / +5 / -4 / -3 | 0.232–0.577 | 1.25–1.47 |
+| figure8 1.6 / 2.0 / 3.0 / 4.0 m/s | 0.166 / 0.202 / 0.293 / 0.392 | **0.105 / 0.124 / 0.186 / 0.254** | 0.325 / 0.423 / 0.760 / 0.887 | **0.197 / 0.263 / 0.427 / 0.564** | -91 to -113 | 0.189–0.515 | 1.21–1.51 |
+| helix (3D) 1.6 / 2.0 / 3.0 / 4.0 m/s | 0.118 / 0.151 / 0.266 / 0.306 | **0.056 / 0.062 / 0.091 / 0.113** | 0.280 / 0.362 / 0.584 / 0.647 | **0.121 / 0.196 / 0.169 / 0.245** | +10 to -9 | 0.210–0.779 | 1.15–1.23 |
+
+High-speed tracking bottleneck identification from recorded telemetry:
+1. **Inner-loop angular-rate response lag (dominant on figure8 and fast reversals, ~65% of residual error)**: cross-correlation between commanded w_cmd and measured body rates shows a **44–60 ms lag (mean 51 ms)** and 5–9% RMS overshoot, yielding 0.05–0.14 rad attitude error during rapid reversals.
+2. **Linear throttle to quadratic motor-thrust mismatch (~25% of 3D/high-thrust error)**: linear bridge scaling u = hover_thrust * a_T / g applied to T = k_f * (150 + 850*u)² yields a hover thrust slope d(a_actual)/d(a_cmd) = 1.273 (measured 1.285–1.396 on 3D helix), producing excess upward thrust at high acceleration.
+3. **Unmodeled rotor drag (~10% in Gazebo, larger in hku-mars/SUPER planner model)**: Gazebo exhibits effective horizontal drag d_h,sim ≈ 0.074 s⁻¹ (0.25 m/s² at 4.0 m/s), whereas hku-mars/SUPER specifies dh = dv = 0.35 s⁻¹ (1.40 m/s² or 0.142 rad tilt at 4.0 m/s).
+
 ### Historical PX4/Gazebo results — sampled-reference version
 
 Successful evidence directories on Jetson:

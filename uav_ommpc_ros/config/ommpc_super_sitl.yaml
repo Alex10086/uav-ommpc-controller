@@ -1,4 +1,4 @@
-# Gazebo SUPER (HKU MaRS YunQue, 280 mm wheelbase) / PX4 rate-loop tuning.
+# Gazebo SUPER (HKU MaRS YunQue, 280 mm wheelbase) / PX4 rate-loop tuned OMMPC configuration.
 # Not validated for real hardware; linear rotor drag (dh=0.35, dv=0.35) is not modeled yet.
 #
 # Hardware & parameter sources:
@@ -11,12 +11,16 @@
 #   * Paper value: 1.50 kg takeoff weight in Ren et al., Science Robotics 10(98), eado6187 (2025).
 # - Paired with px4_bridge hover_thrust=0.309128 (for 1.64 kg; 0.287942 if using 1.50 kg) and max_throttle=0.9.
 #   Bridge thrust ceiling at hover_thrust=0.309128 is 9.80665 * 0.9 / 0.309128 = 28.55 m/s^2 > 20.0 m/s^2.
+# - Tuned for SUPER's compact inertia (Ixx=Iyy=0.0085 kg*m^2) and ~40 ms inner rate loop:
+#   * horizon=20, dt=0.02 s (0.40 s window; cuts QP dimension from 120 to 80 and solve latency by >50%)
+#   * Horizontal feedback gain K=[-3.095, -3.434, 8.343] (4-state damping zeta=0.72 with 40 ms rate lag)
+#   * Vertical feedback gain Kz=[-14.9, -9.1] (suppresses quadratic motor thrust mapping bias)
 ommpc_node:
   ros__parameters:
-    horizon: 30
+    horizon: 20
     dt: 0.02
-    state_weights: [30.0, 30.0, 60.0, 20.0, 20.0, 30.0, 80.0, 80.0, 40.0]
-    terminal_weights: [60.0, 60.0, 120.0, 40.0, 40.0, 60.0, 160.0, 160.0, 80.0]
-    input_weights: [4.0, 20.0, 20.0, 5.0]
+    state_weights: [300.0, 300.0, 400.0, 85.0, 85.0, 80.0, 80.0, 80.0, 60.0]
+    terminal_weights: [4500.0, 4500.0, 6000.0, 255.0, 255.0, 240.0, 160.0, 160.0, 120.0]
+    input_weights: [1.2, 10.0, 10.0, 4.0]
     input_min: [1.0, -3.0, -3.0, -1.5]
     input_max: [20.0, 3.0, 3.0, 1.5]
