@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <limits>
 
 #include <gtest/gtest.h>
@@ -14,6 +15,7 @@ using uav_ommpc_ros::Limits;
 namespace
 {
 const Limits kLimits{0.7, {3.0, 3.0, 1.5}, 0.9};
+const Limits kSuperQuadraticLimits{0.309128, {3.0, 3.0, 1.5}, 0.9, true, 150.0, 1000.0};
 const CommandState::Clock::time_point kStart{};
 
 ThrustRates input(double thrust, double roll = 0.0, double pitch = 0.0, double yaw = 0.0)
@@ -82,4 +84,41 @@ TEST(CommandStateLimits, ClampsEachRateAxisAndThrottle)
   EXPECT_FLOAT_EQ(state.command().body_rates[2], 1.5f);
   EXPECT_FLOAT_EQ(state.command().throttle, 0.9f);
   EXPECT_TRUE(state.command().limited);
+}
+
+TEST(CommandStateLimits, QuadraticInverseThrustMappingRecoversExactRotorAcceleration)
+{
+  CommandState state(kSuperQuadraticLimits, 500ms);
+  // At 1g hover, quadratic inverse must equal hover_thrust exactly.
+  ASSERT_TRUE(state.accept(input(kGravity), kStart));
+  EXPECT_NEAR(state.command().throttle, 0.309128f, 1e-6f);
+  EXPECT_FALSE(state.command().limited);
+
+  // Across [6.0, 20.0] m/s^2, simulated quadratic rotor thrust g * (omega(u) / omega_hover)^2
+  // must match the commanded thrust acceleration to float32 precision.
+  const double hover_speed = 150.0 + 850.0 * kSuperQuadraticLimits.hover_thrust;
+  for (double desired_a : {6.0, 8.0, 9.80665, 12.0, 14.5, 18.0, 20.0}) {
+    ASSERT_TRUE(state.accept(input(desired_a), kStart));
+    const double u = state.command().throttle;
+    const double rotor_speed = 150.0 + 850.0 * u;
+    const double actual_a = kGravity * (rotor_speed / hover_speed) * (rotor_speed / hover_speed);
+    EXPECT_NEAR(actual_a, desired_a, 1e-4);
+    EXPECT_FALSE(state.command().limited);
+  }
+
+  // Below idle rotor thrust, throttle clamps cleanly at 0.0.
+  ASSERT_TRUE(state.accept(input(0.0), kStart));
+  EXPECT_FLOAT_EQ(state.command().throttle, 0.0f);
+  EXPECT_TRUE(state.command().limited);
+  ASSERT_TRUE(state.accept(input(1.0), kStart));
+  EXPECT_FLOAT_EQ(state.command().throttle, 0.0f);
+  EXPECT_TRUE(state.command().limited);
+
+  ASSERT_TRUE(state.accept(input(100.0), kStart));
+  EXPECT_FLOAT_EQ(state.command().throttle, 0.9f);
+  EXPECT_TRUE(state.command().limited);
+
+  // Rejected input must not renew the lease in quadratic mode either.
+  EXPECT_FALSE(state.accept(input(std::numeric_limits<double>::infinity()), kStart + 400ms));
+  EXPECT_FALSE(state.fresh(kStart + 501ms));
 }

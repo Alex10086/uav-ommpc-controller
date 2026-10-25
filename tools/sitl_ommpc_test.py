@@ -474,7 +474,7 @@ class Flight(ReferencePublisher):
                 raise RuntimeError('Missing terminal line reference')
             terminal = np.array(selected[0].position)
             self.f_settle(terminal)
-        elif mode in ('circle', 'figure8', 'helix'):
+        elif mode in ('circle', 'figure8', 'helix', 'scurve'):
             if self.f_speed_override is not None:
                 self.config['speed'] = float(self.f_speed_override)
             elif mode == 'circle':
@@ -483,15 +483,14 @@ class Flight(ReferencePublisher):
                 self.config['speed'] = 1.2
             if self.f_radius_override is not None:
                 self.config['radius'] = float(self.f_radius_override)
-            elif mode in ('figure8', 'helix'):
+            elif mode in ('figure8', 'helix', 'scurve'):
                 self.config['radius'] = 1.2
             if self.f_z_amp_override is not None:
                 self.config['z_amp'] = float(self.f_z_amp_override)
             if self.f_ramp_override is not None:
                 self.config['ramp'] = float(self.f_ramp_override)
             use_loops = self.f_loops_override
-            if use_loops is None and (mode in ('figure8', 'helix') or self.config['speed'] > 0.4):
-                # Ensure smooth braking back to origin on faster/complex curves
+            if use_loops is None and (mode in ('figure8', 'helix', 'scurve') or self.config['speed'] > 0.4):
                 use_loops = 2.0
             self.config['loops'] = use_loops
             self.set_trajectory(mode, origin, self.f_yaw)
@@ -500,7 +499,8 @@ class Flight(ReferencePublisher):
                 duration = self.config['start_delay'] + 2.0*self.config['ramp'] + cruise
                 end = time.monotonic() + duration + 0.5
                 self.f_until(lambda: time.monotonic() >= end, duration + 4., f'smooth {mode} trajectory')
-                self.f_settle(origin)
+                terminal = np.array(self.trajectory.flat(duration + 1.0).position)
+                self.f_settle(terminal)
             else:
                 duration = 2.+3.+max(18., 2.*math.pi*self.config['radius']/self.config['speed'])
                 end = time.monotonic()+duration
@@ -509,6 +509,25 @@ class Flight(ReferencePublisher):
                 if selected is None:
                     raise RuntimeError('Missing circle reference at completion')
                 self.f_settle(np.array(selected[0].position))
+        elif mode == 'sharp3d':
+            if self.f_speed_override is not None:
+                self.config['speed'] = float(self.f_speed_override)
+            else:
+                self.config['speed'] = 3.6
+            if self.f_radius_override is not None:
+                self.config['radius'] = float(self.f_radius_override)
+            else:
+                self.config['radius'] = 1.6
+            if self.f_z_amp_override is not None:
+                self.config['z_amp'] = float(self.f_z_amp_override)
+            else:
+                self.config['z_amp'] = 0.60
+            self.set_trajectory(mode, origin, self.f_yaw)
+            T_leg, _, end_pt = self.trajectory._sharp3d_setup()
+            duration = self.config['start_delay'] + 4.0 * T_leg
+            end = time.monotonic() + duration + 0.5
+            self.f_until(lambda: time.monotonic() >= end, duration + 4., 'smooth 4-leg 3D sharp turn trajectory')
+            self.f_settle(np.array(end_pt))
         elif mode == 'hover_to_hover':
             self.set_trajectory(mode, origin, self.f_yaw)
             dist = float(np.linalg.norm(self.config['offset']))
@@ -520,7 +539,7 @@ class Flight(ReferencePublisher):
         metrics = self.f_metrics(mode)
         if metrics['position_error_max'] is None or metrics['position_error_max'] > 1.:
             raise RuntimeError(f'{mode}: maximum tracking error exceeds 1 m')
-        if mode in ('constant_velocity', 'circle', 'figure8', 'helix', 'hover_to_hover'):
+        if mode in ('constant_velocity', 'circle', 'figure8', 'helix', 'scurve', 'sharp3d', 'hover_to_hover'):
             if metrics['position_error_rmse'] > self.f_max_pos_rmse or metrics['velocity_error_rmse'] > self.f_max_vel_rmse:
                 raise RuntimeError(f'{mode}: moving tracking RMSE exceeds position/velocity limits')
         self.f_phase_done()

@@ -40,6 +40,9 @@ public:
     const auto max_body_rates =
       declare_parameter<std::vector<double>>("max_body_rates", std::vector<double>{3.0, 3.0, 1.5});
     const auto max_throttle = declare_parameter<double>("max_throttle", 0.9);
+    const auto quadratic_thrust_model = declare_parameter<bool>("quadratic_thrust_model", false);
+    const auto min_motor_speed = declare_parameter<double>("min_motor_speed", 150.0);
+    const auto max_motor_speed = declare_parameter<double>("max_motor_speed", 1000.0);
     const auto rate = declare_parameter<double>("rate", 50.0);
     const auto timeout = declare_parameter<double>("command_timeout", 0.5);
     const auto target_system = declare_parameter<std::int64_t>("target_system", 1);
@@ -56,6 +59,11 @@ public:
     if (!std::isfinite(max_throttle) || max_throttle <= 0.0 || max_throttle > 1.0) {
       throw std::invalid_argument("max_throttle must be finite and in (0, 1]");
     }
+    if (!std::isfinite(min_motor_speed) || !std::isfinite(max_motor_speed) ||
+      min_motor_speed < 0.0 || max_motor_speed <= min_motor_speed)
+    {
+      throw std::invalid_argument("min_motor_speed and max_motor_speed must be finite with 0 <= min < max");
+    }
     if (!std::isfinite(rate) || rate <= 0.0) {
       throw std::invalid_argument("rate must be finite and positive");
     }
@@ -70,7 +78,13 @@ public:
     target_system_ = static_cast<std::uint8_t>(target_system);
     target_component_ = static_cast<std::uint8_t>(target_component);
     state_.emplace(
-      Limits{hover_thrust, {max_body_rates[0], max_body_rates[1], max_body_rates[2]}, max_throttle},
+      Limits{
+        hover_thrust,
+        {max_body_rates[0], max_body_rates[1], max_body_rates[2]},
+        max_throttle,
+        quadratic_thrust_model,
+        min_motor_speed,
+        max_motor_speed},
       std::chrono::duration_cast<CommandState::Clock::duration>(
         std::chrono::duration<double>(timeout)));
 

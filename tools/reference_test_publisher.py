@@ -23,7 +23,7 @@ from px4_msgs.msg import VehicleOdometry
 from uav_ommpc_interfaces.msg import PolynomialSegment, PolynomialTrajectory
 
 G = 9.80665
-MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'figure8', 'helix', 'hover_to_hover')
+MODES = ('hover', 'target_step', 'constant_velocity', 'circle', 'figure8', 'helix', 'scurve', 'sharp3d', 'hover_to_hover')
 RATE_LIMITS = np.array([3.0, 3.0, 1.5])
 MAX_SPEED = 4.0
 MAX_ACCELERATION = 8.0
@@ -251,7 +251,46 @@ class Trajectory:
             return self.speed / (math.sqrt(2.0) * self.radius)
         if self.mode == 'helix':
             return self.speed / math.sqrt(self.radius**2 + 4.0 * self.z_amp**2)
+        if self.mode == 'scurve':
+            return self.speed / (1.25 * self.radius)
         return 0.0
+
+    def _sharp3d_setup(self):
+        if getattr(self, '_sharp3d_cache', None) is not None:
+            return self._sharp3d_cache
+        R, z_a = self.radius, self.z_amp
+        pts = np.array([
+            self.origin,
+            self.origin + np.array([1.6*R, 0.9*R, -z_a]),
+            self.origin + np.array([0.2*R, -1.0*R, +z_a]),
+            self.origin + np.array([1.7*R, -0.7*R, -0.9*z_a]),
+            self.origin,
+        ])
+        chords = np.diff(pts, axis=0)
+        lens = np.linalg.norm(chords, axis=1)
+        dirs = chords / lens[:, None]
+        L_max = float(np.max(lens))
+        t_vecs, n_vecs = [np.zeros(3)], [np.zeros(3)]
+        for k in range(1, 4):
+            tk = dirs[k-1] + dirs[k]; tk /= np.linalg.norm(tk)
+            nk = dirs[k] - dirs[k-1]; nk /= np.linalg.norm(nk)
+            t_vecs.append(tk); n_vecs.append(nk)
+        t_vecs.append(np.zeros(3)); n_vecs.append(np.zeros(3))
+        unit_states = [(pts[k], 0.18*L_max*t_vecs[k], 1.5*L_max*n_vecs[k], np.zeros(3)) for k in range(5)]
+        s_grid = np.linspace(0., 1., 101)
+        V0 = 0.0
+        for m in range(4):
+            c = hermite7(unit_states[m], unit_states[m+1], 1.0)
+            d0 = d1 = np.zeros((101, 3))
+            for row in reversed(c):
+                d1 = d1 * s_grid[:, None] + d0
+                d0 = d0 * s_grid[:, None] + row
+            V0 = max(V0, float(np.max(np.linalg.norm(d1, axis=1))))
+        T_leg = V0 / self.speed
+        real_states = [(pts[k], (0.18*L_max/T_leg)*t_vecs[k], (1.5*L_max/T_leg**2)*n_vecs[k], np.zeros(3)) for k in range(5)]
+        coeffs = [hermite7(real_states[m], real_states[m+1], T_leg) for m in range(4)]
+        self._sharp3d_cache = (T_leg, coeffs, pts[-1])
+        return self._sharp3d_cache
 
     def _curve_cruise_duration(self):
         if self.loops is None:
@@ -330,6 +369,31 @@ class Trajectory:
             dddp = np.array([-self.radius*c1, -self.radius*s1, 8.0*self.z_amp*c2])
             return FlatSample(p, dp*w, ddp*(w*w) + dp*alpha,
                               dddp*(w**3) + 3.0*ddp*w*alpha + dp*beta, self.yaw, 0.)
+        if self.mode == 'scurve':
+            theta, w, alpha, beta = self._angular_progress(travel)
+            s1, c1 = math.sin(theta), math.cos(theta)
+            p = self.origin + self.radius * np.array([0.75*theta, s1, 0.0])
+            dp = self.radius * np.array([0.75, c1, 0.0])
+            ddp = self.radius * np.array([0.0, -s1, 0.0])
+            dddp = self.radius * np.array([0.0, -c1, 0.0])
+            return FlatSample(p, dp*w, ddp*(w*w) + dp*alpha,
+                              dddp*(w**3) + 3.0*ddp*w*alpha + dp*beta, self.yaw, 0.)
+        if self.mode == 'sharp3d':
+            T_leg, coeffs, end_pt = self._sharp3d_setup()
+            if elapsed <= self.start_delay:
+                return FlatSample(self.origin.copy(), np.zeros(3), np.zeros(3), np.zeros(3), self.yaw, 0.)
+            if travel >= 4.0 * T_leg:
+                return FlatSample(end_pt.copy(), np.zeros(3), np.zeros(3), np.zeros(3), self.yaw, 0.)
+            idx = min(3, int(math.floor(travel / T_leg)))
+            s = (travel - idx * T_leg) / T_leg
+            c = coeffs[idx]
+            d0 = d1 = d2 = d3 = np.zeros(3)
+            for row in reversed(c):
+                d3 = d3 * s + 3.0 * d2
+                d2 = d2 * s + 2.0 * d1
+                d1 = d1 * s + d0
+                d0 = d0 * s + row
+            return FlatSample(d0, d1 / T_leg, d2 / T_leg**2, d3 / T_leg**3, self.yaw, 0.)
         if self.mode == 'hover_to_hover':
             travel = max(elapsed-self.start_delay, 0.)
             dist = float(np.linalg.norm(self.offset))
@@ -383,24 +447,6 @@ class Trajectory:
             last = math.ceil(end/self.segment_duration)
             knots.extend(k*self.segment_duration for k in range(first, last)
                          if anchor < k*self.segment_duration < end)
-            if self.mode == 'constant_velocity':
-                boundaries = [self.start_delay, self.start_delay+self.ramp,
-                              self.start_delay+self.ramp+self.line_duration,
-                              self.start_delay+2.*self.ramp+self.line_duration]
-            elif self.mode == 'hover_to_hover':
-                dist = float(np.linalg.norm(self.offset))
-                duration = (35.0/16.0)*dist/self.speed
-                boundaries = [self.start_delay, self.start_delay+duration]
-            elif self.mode in ('circle', 'figure8', 'helix') and self.loops is not None:
-                cruise = self._curve_cruise_duration()
-                boundaries = [self.start_delay, self.start_delay+self.ramp,
-                              self.start_delay+self.ramp+cruise,
-                              self.start_delay+2.*self.ramp+cruise]
-            else:
-                boundaries = [self.start_delay, self.start_delay+self.ramp]
-            for b in boundaries:
-                if anchor < b < end and min(abs(b - k) for k in knots) > 0.02:
-                    knots.append(b)
             ordered = sorted(set(knots))
             knots = [ordered[0]]
             for knot in ordered[1:]:
@@ -423,7 +469,10 @@ class Trajectory:
                 dist = float(np.linalg.norm(self.offset))
                 duration = (35.0/16.0)*dist/self.speed  # Peak speed equals self.speed.
                 msg.hold_final = end >= self.start_delay+duration
-            elif self.mode in ('circle', 'figure8', 'helix') and self.loops is not None:
+            elif self.mode == 'sharp3d':
+                T_leg, _, _ = self._sharp3d_setup()
+                msg.hold_final = end >= self.start_delay+4.*T_leg
+            elif self.mode in ('circle', 'figure8', 'helix', 'scurve') and self.loops is not None:
                 cruise = self._curve_cruise_duration()
                 msg.hold_final = end >= self.start_delay+2.*self.ramp+cruise
         check_message(msg, max_thrust=self.max_thrust, max_speed=self.max_speed,
@@ -642,7 +691,10 @@ def main():
                 end = duration
             elif args.mode == 'constant_velocity':
                 end = trajectory.start_delay+2*trajectory.ramp+trajectory.line_duration
-            elif args.mode in ('circle', 'figure8', 'helix'):
+            elif args.mode == 'sharp3d':
+                T_leg, _, _ = trajectory._sharp3d_setup()
+                end = trajectory.start_delay + 4.0 * T_leg
+            elif args.mode in ('circle', 'figure8', 'helix', 'scurve'):
                 if trajectory.loops is not None:
                     end = trajectory.start_delay + 2*trajectory.ramp + trajectory._curve_cruise_duration()
                 else:

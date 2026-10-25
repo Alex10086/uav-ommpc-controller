@@ -18,6 +18,9 @@ struct Limits
   double hover_thrust;                   // normalized throttle at thrust_acceleration == g
   std::array<double, 3> max_body_rates;  // rad/s, symmetric per FRD axis
   double max_throttle;                   // normalized, (0, 1]
+  bool quadratic_thrust_model{false};    // true: invert T ~ omega^2 on [min_motor_speed, max_motor_speed]
+  double min_motor_speed{150.0};         // rad/s at zero throttle (PX4 SIM_GZ_EC_MIN)
+  double max_motor_speed{1000.0};        // rad/s at full throttle (PX4 SIM_GZ_EC_MAX)
 };
 
 struct RateCommand
@@ -26,6 +29,20 @@ struct RateCommand
   float throttle{};
   bool limited{false};
 };
+
+// Unclipped throttle for a finite, nonnegative specific thrust; validated motor limits required.
+// When quadratic_thrust_model is enabled, inverts omega(u) = omega_min + (omega_max - omega_min) * u
+// under rotor thrust T_i = k_f * omega^2 calibrated at hover (a_T == g <=> u == hover_thrust).
+inline double compute_throttle(const Limits & limits, double thrust_acceleration)
+{
+  if (!limits.quadratic_thrust_model) {
+    return limits.hover_thrust * thrust_acceleration / kGravity;
+  }
+  const double speed_span = limits.max_motor_speed - limits.min_motor_speed;
+  const double hover_speed = limits.min_motor_speed + speed_span * limits.hover_thrust;
+  const double desired_speed = hover_speed * std::sqrt(thrust_acceleration / kGravity);
+  return (desired_speed - limits.min_motor_speed) / speed_span;
+}
 
 // Latest accepted control input. Rejected input keeps the previous command and its age.
 class CommandState
@@ -51,9 +68,9 @@ public:
       command.limited |= rate != input.body_rates[axis];
       command.body_rates[axis] = static_cast<float>(rate);
     }
-    const double throttle = limits_.hover_thrust * input.thrust_acceleration / kGravity;
-    command.limited |= throttle > limits_.max_throttle;
-    command.throttle = static_cast<float>(std::min(throttle, limits_.max_throttle));
+    const double throttle = compute_throttle(limits_, input.thrust_acceleration);
+    command.limited |= throttle < 0.0 || throttle > limits_.max_throttle;
+    command.throttle = static_cast<float>(std::clamp(throttle, 0.0, limits_.max_throttle));
     command_ = command;
     last_accepted_ = now;
     return true;

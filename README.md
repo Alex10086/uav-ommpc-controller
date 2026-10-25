@@ -807,9 +807,84 @@ All trajectories enforce kinematic bounds v <= 4.0 m/s, a <= 8.0 m/s², j <= 20.
 | helix (3D) 1.6 / 2.0 / 3.0 / 4.0 m/s | 0.118 / 0.151 / 0.266 / 0.306 | **0.056 / 0.062 / 0.091 / 0.113** | 0.280 / 0.362 / 0.584 / 0.647 | **0.121 / 0.196 / 0.169 / 0.245** | +10 to -9 | 0.210–0.779 | 1.15–1.23 |
 
 High-speed tracking bottleneck identification from recorded telemetry:
-1. **Inner-loop angular-rate response lag (dominant on figure8 and fast reversals, ~65% of residual error)**: cross-correlation between commanded w_cmd and measured body rates shows a **44–60 ms lag (mean 51 ms)** and 5–9% RMS overshoot, yielding 0.05–0.14 rad attitude error during rapid reversals.
-2. **Linear throttle to quadratic motor-thrust mismatch (~25% of 3D/high-thrust error)**: linear bridge scaling u = hover_thrust * a_T / g applied to T = k_f * (150 + 850*u)² yields a hover thrust slope d(a_actual)/d(a_cmd) = 1.273 (measured 1.285–1.396 on 3D helix), producing excess upward thrust at high acceleration.
-3. **Unmodeled rotor drag (~10% in Gazebo, larger in hku-mars/SUPER planner model)**: Gazebo exhibits effective horizontal drag d_h,sim ≈ 0.074 s⁻¹ (0.25 m/s² at 4.0 m/s), whereas hku-mars/SUPER specifies dh = dv = 0.35 s⁻¹ (1.40 m/s² or 0.142 rad tilt at 4.0 m/s).
+1. **Inner-loop angular-rate response**: attitude-difference estimates suggest 44–60 ms of end-to-end rate lag. Transport, recording timestamps, filtering and motor dynamics are confounded; this is not an isolated identification of the PX4 rate loop.
+2. **Throttle/thrust mismatch**: the linear bridge law applied to the Gazebo quadratic motor law has hover slope 1.273. The controlled mapping comparison below tests its effect with unchanged OMMPC parameters.
+3. **Rotor drag**: acceleration residuals suggest an effective horizontal damping near 0.074 s⁻¹ in this simulation, but also contain timing, estimator and thrust-model errors. The planner's `dh/dv=0.35` values must be checked against its equations and units before reuse. No experiment established percentage contributions of these three effects.
+
+#### Optional quadratic inverse thrust mapping: unchanged OMMPC A/B comparison
+
+The original linear mapping remains the **default** (`quadratic_thrust_model=false`).
+Only `px4_bridge` changes the acceleration-to-throttle conversion; the optimizer,
+prediction model, Q/R/terminal weights, N=20 and dt=0.02 s remain unchanged.
+Enable the calibrated SUPER mapping explicitly:
+
+```bash
+ros2 run uav_ommpc_ros px4_bridge --ros-args \
+  -p hover_thrust:=0.309128 -p quadratic_thrust_model:=true \
+  -p min_motor_speed:=150.0 -p max_motor_speed:=1000.0
+```
+
+For `span = omega_max - omega_min`, the mapping is:
+
+```text
+omega_hover = omega_min + span * hover_thrust
+omega_desired = omega_hover * sqrt(thrust_acceleration / 9.80665)
+throttle = clamp((omega_desired - omega_min) / span, 0, max_throttle)
+```
+
+This is the exact static inverse of the **calibrated equal-rotor quadratic model**,
+not an exact inverse of the entire PX4 allocator, motor transients or real aircraft.
+It assumes normalized throttle maps linearly to rotor speed (the tested Gazebo
+ESC range); do not combine it blindly with PX4 thrust linearization or a different
+ESC law. Differential rotor speeds used for attitude control also change total
+thrust. Recalibrate for another vehicle, payload or battery condition.
+Below idle thrust the requested acceleration is physically unreachable: output
+clamps to zero throttle and reports `limited`, not zero physical rotor thrust.
+The upper throttle clamp, signed body-rate limits, input rejection, watchdog and
+Offboard ownership remain in effect.
+
+`tools/sitl_thrust_mapping_ab.sh` runs four cases × two mappings × three repeats.
+It requires the existing simulator-only DDS/GCS environment and refuses to
+overwrite result directories. `CASE_FILTER`, `FIRST_RUN`, `REPEATS`, `MAPPINGS`
+and `OUT_ROOT` select additional runs. The script uses an exploratory tilt abort
+of **1.0 rad** and phase RMSE thresholds of **1.0 m / 1.0 m/s**, not the older
+0.6 rad / 0.35 m / 0.3 m/s criteria. Do not equate its `passed` flag with the
+older qualification. Logs and CSV evidence are under
+`~/uav_control_ws/ommpc-flight-results/thrmap-{linear,quadratic}-*-r*`.
+These runs did not record rosbag. Analyze with:
+
+```bash
+python3 tools/analyze_thrust_mapping.py
+```
+
+A/B observations, mean of three completed trajectory runs per cell (phase RMSE includes the initial hold and final settling; moving Z RMSE uses reference speed >0.05 m/s):
+
+| Case | Linear position RMSE (m) | Quadratic position RMSE (m) | Linear moving Z RMSE (m) | Quadratic moving Z RMSE (m) | Linear velocity RMSE (m/s) | Quadratic velocity RMSE (m/s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Helix, 3.0 m/s, R=1.6 m, Az=0.40 m | 0.0882 | 0.0812 | 0.0704 | 0.0575 | 0.1327 | 0.1075 |
+| Sharp3D, 3.85 m/s, R=1.65 m, Az=0.60 m | 0.1688 | 0.1619 | 0.0414 | 0.0352 | 0.1930 | 0.1799 |
+| Hover-to-hover, 4.0 m/s, displacement 4.5 m | 0.1276 | 0.1285 | 0.0127 | 0.0152 | 0.1411 | 0.1408 |
+| S-curve, 3.9 m/s, R=1.6 m, two periods | 0.1837 | 0.1819 | 0.0228 | 0.0242 | 0.1934 | 0.1894 |
+
+The initial campaign completed 23/24 flights. Quadratic S-curve r2 aborted
+before entering the requested trajectory because a command/rate gap exceeded
+0.3 s; native landing and disarm were observed. Its evidence is retained, and
+the analysis counts it as a failed attempt with missing trajectory metrics.
+An additional quadratic S-curve r4 completed successfully. Its aggregate uses
+r1/r3/r4, with **3 successful trajectories out of 4 attempts**, not 3/3 success.
+The full campaign therefore has 24 completed flights out of 25 attempts.
+The final bridge build passed 21 ROS-package tests, including inverse mapping,
+lower/upper throttle clipping and rejected-input watchdog behavior; the r4
+flight exercised that final build. No OMMPC weights or model were changed.
+
+The clearest benefit is vertical tracking in Helix: moving Z RMSE decreased
+18.3%, velocity RMSE 18.9%, and mean NED-down bias changed from -0.0202 m
+to -0.0008 m. Its odometry-derived thrust gain estimate changed from 1.326
+to 1.008; differentiation, timestamp alignment and drag limit identification
+accuracy. Horizontal point-to-point position RMSE did not improve. This does
+not demonstrate a universal tracking improvement or establish causal error
+fractions. Mapping groups ran sequentially rather than randomized/interleaved.
+
 
 ### Historical PX4/Gazebo results — sampled-reference version
 

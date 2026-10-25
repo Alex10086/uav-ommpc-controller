@@ -125,19 +125,24 @@ class PolynomialTrajectoryTests(unittest.TestCase):
         self.assertEqual(MAX_ACCELERATION, 8.0)
         self.assertEqual(MAX_JERK, 20.0)
         origin = np.array([0., 0., -2.])
-        for mode in ['figure8', 'helix']:
+        for mode in ['figure8', 'helix', 'scurve', 'sharp3d']:
             traj = Trajectory(mode, origin=origin, yaw=0.5, radius=1.2, z_amp=0.35,
                               speed=1.6, loops=2.0, start_delay=2.0, ramp=3.0,
                               max_thrust=VEHICLES['super']['max_thrust'])
-            cruise = traj._curve_cruise_duration()
-            total_end = 2.0 + 2.0 * 3.0 + cruise
+            if mode == 'sharp3d':
+                T_leg, _, _ = traj._sharp3d_setup()
+                total_end = 2.0 + 4.0 * T_leg
+            else:
+                cruise = traj._curve_cruise_duration()
+                total_end = 2.0 + 2.0 * 3.0 + cruise
             for elapsed in [0., 2.0, 4.5, 8.0, total_end + 1.0]:
                 msg = traj.message(10**9, elapsed)
                 check_message(msg, max_thrust=VEHICLES['super']['max_thrust'])
             end_msg = traj.message(10**9, total_end + 2.0)
             self.assertTrue(end_msg.hold_final)
             end_state = sample_reference(end_msg, 30.0)
-            np.testing.assert_allclose(end_state.position, origin, atol=1e-9)
+            expected_end = origin + (np.array([0.75 * 1.2 * 4.0 * math.pi, 0., 0.]) if mode == 'scurve' else np.zeros(3))
+            np.testing.assert_allclose(end_state.position, expected_end, atol=1e-9)
             np.testing.assert_allclose(end_state.velocity, np.zeros(3), atol=1e-9)
 
     def test_analytic_body_rates_match_orientation_derivative(self):
@@ -151,7 +156,7 @@ class PolynomialTrajectoryTests(unittest.TestCase):
         np.testing.assert_allclose(sample.body_rates, .5*np.array([w[2, 1]-w[1, 2], w[0, 2]-w[2, 0], w[1, 0]-w[0, 1]]), atol=1e-8)
 
     def test_knots_and_overlapping_windows_are_c3_and_time_continuous(self):
-        for mode in ['constant_velocity', 'circle', 'figure8', 'helix', 'hover_to_hover']:
+        for mode in ['constant_velocity', 'circle', 'figure8', 'helix', 'scurve', 'sharp3d', 'hover_to_hover']:
             trajectory = Trajectory(mode, start_delay=2.173, ramp=2.837)
             previous = None
             for elapsed in [0., 2., 2.51, 3.01, 4.99, 5.51, 13.01, 16.01, 100.]:

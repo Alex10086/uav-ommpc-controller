@@ -19,7 +19,7 @@ import numpy as np
 
 THRUST_LIMITS = (1.0, 12.0)
 RATE_LIMITS = np.array([3.0, 3.0, 1.5])
-MOVING_PHASES = ('hover_to_hover', 'circle', 'figure8', 'helix', 'constant_velocity')
+MOVING_PHASES = ('hover_to_hover', 'circle', 'figure8', 'helix', 'scurve', 'sharp3d', 'constant_velocity')
 
 
 def compute_lag_from_trace(directory, phase_name):
