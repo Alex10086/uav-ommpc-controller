@@ -1,13 +1,20 @@
 #!/bin/bash
-# Sequential SITL hover_to_hover speed sweep. PX4 is restarted between points so
-# each run starts from the same landed state. Test-only; never real hardware.
+# Repeat SITL hover_to_hover runs at fixed speeds, restarting PX4 between runs so
+# each starts landed and disarmed with the same initial condition.
+#
+#   SPEEDS='0.8 1.6 2.0' REPEATS=3 LABEL=ommpc bash tools/sitl_hover_to_hover_sweep.sh
+#
+# The controller under test runs separately (ommpc_node or tools/pd_so3_node.py);
+# this script only publishes references and records evidence. Test-only: never
+# real hardware.
 set +u
-SPEEDS="${SPEEDS:-0.4 0.8 1.2 1.6}"
+SPEEDS="${SPEEDS:-0.4 0.8 1.2 1.6 2.0}"
 OFFSET="${OFFSET:-2.0 0.0 0.0}"
+REPEATS="${REPEATS:-1}"
+LABEL="${LABEL:-sweep}"
 OUT_ROOT="${OUT_ROOT:-$HOME/uav_control_ws/ommpc-flight-results}"
 
 restart_px4() {
-  # The PX4 build needs its own virtualenv; ROS must not be sourced in that shell.
   pkill -9 -f 'bin/px4' 2>/dev/null
   pkill -9 -f 'gz sim' 2>/dev/null
   sleep 2
@@ -29,12 +36,14 @@ source "$HOME/ros2-px4-env.bash"
 source "$HOME/uav_control_ws/install/setup.bash"
 
 for speed in $SPEEDS; do
-  echo "=== speed=${speed} m/s offset=${OFFSET} ==="
-  restart_px4
-  cd "$HOME/uav_control_ws/src/uav-ommpc-controller" || exit 1
-  python3 tools/sitl_ommpc_test.py --confirm-sitl --mode hover_to_hover \
-    --speed "$speed" --offset $OFFSET --record-bag \
-    --output-dir "$OUT_ROOT/sweep-${speed}ms" 2>&1 | tail -n 20
-  rc=${PIPESTATUS[0]}
-  echo "=== speed=${speed} exit=${rc} ==="
+  for run in $(seq 1 "$REPEATS"); do
+    echo "=== label=${LABEL} speed=${speed} run=${run}/${REPEATS} offset=${OFFSET} ==="
+    restart_px4
+    cd "$HOME/uav_control_ws/src/uav-ommpc-controller" || exit 1
+    python3 tools/sitl_ommpc_test.py --confirm-sitl --mode hover_to_hover \
+      --speed "$speed" --offset $OFFSET --record-bag \
+      --output-dir "$OUT_ROOT/${LABEL}-${speed}ms-r${run}" > /tmp/run-${LABEL}-${speed}-${run}.log 2>&1
+    rc=$?
+    echo "=== label=${LABEL} speed=${speed} run=${run} exit=${rc} ==="
+  done
 done

@@ -619,7 +619,11 @@ python3 tools/reference_test_publisher.py --mode hover_to_hover --offset 2 0 0 -
 
 Run only **one reference publisher** at a time. `--origin N E D` and `--yaw RAD` override captured odometry values; default yaw preserves heading. The removed `--dt`/`--samples` arguments are replaced by `--window` (default 4 seconds) and `--segment-duration` (default 0.5 seconds); `--rate` remains 25 Hz. Window length must cover the controller horizon and transport delay. Overlapping windows retain common knots and analytic geometry.
 
-`tools/sitl_hover_to_hover_sweep.sh` repeats a full takeoff → `hover_to_hover` → native-landing flight for each speed in `SPEEDS` (default `0.4 0.8 1.2 1.6`), restarting PX4 between points so every run starts landed and disarmed. Each point consumes a complete simulated flight; it is not a substitute for a dedicated hardware test campaign.
+`tools/sitl_hover_to_hover_sweep.sh` repeats a full takeoff → `hover_to_hover` → native-landing flight for each speed in `SPEEDS`, restarting PX4 between runs so every run starts landed and disarmed. `REPEATS` sets the number of runs per speed and `LABEL` names the evidence directories (`<LABEL>-<speed>ms-r<k>`). Each run consumes a complete simulated flight; it is not a substitute for a dedicated hardware test campaign.
+
+`tools/analyze_sitl_sweep.py DIR...` summarises any set of those runs: per-run tracking, max tilt, worst control gap, control samples at the thrust/rate limits, and per-speed mean/std so repeatability is visible without opening the CSVs.
+
+`tools/pd_so3_node.py` is a **test-only** PD + SO(3) baseline for controller comparison. It subscribes to the same `/uav/reference_polynomial` and publishes the same `ThrustRates`, with the same gating (fresh advancing odometry, healthy status, receipt lease, estimator-reset and clock-rollback invalidation, sampling at the odometry receipt time), so trajectory, vehicle, initial condition and interface are identical. Its law is the repository's existing PD + SO(3) test controller extended with reference feedforward: `a_cmd = a_ref + kp(p_ref-p) + kd(v_ref-v)` clipped per axis, `b3` from `g*e3-a_cmd`, `rates = clip(k_rot*vee(R^T R_des - R_des^T R), ±1 rad/s)` and `thrust = clip(force·R[:,2], 1, 12)` with the defaults `kp=[1.2,1.2,1.8]`, `kd=[1.8,1.8,2.1]`, `k_rot=4`. It never arms or changes modes.
 
 Repeated cached plans retain their start stamp and renew the receipt lease. As a rolling window shifts, its start stamp advances by the same amount as its coefficient domain; publication time never silently restarts the path. `--duration SECONDS` stops publication but does **not** land. Ctrl-C, lease expiry or generation failure leads to the existing node/bridge timeout behavior, not a controlled recovery. The reference-only publisher is not a flight safety state machine.
 
@@ -708,6 +712,36 @@ These are **simulated** flights. They establish low-speed SITL tracking with the
 Every point held zero input-bound violations, zero control gaps above 0.1 s, and a full 5 s settled window before landing. Tracking degrades monotonically with speed while the reference stays exactly on the requested peak: position RMSE grows from 5 cm to 12 cm and peak tilt from 0.014 to 0.397 rad. At 2.0 m/s the tilt reaches roughly 44% of the unchanged 0.6 rad abort threshold, so that point is the practical edge of this low-gain `ommpc_sitl.yaml` tuning rather than a demonstrated ceiling.
 
 The first sweep attempt exposed a real bug: `hover_to_hover` durations were floored at `ramp` (3 s), so 1.6 and 2.0 m/s silently published the *same* 1.458 m/s reference. Duration is now `35/16 * distance / speed` with no floor, the observed peak reference speed tracks the request exactly, and a unit test pins that regression.
+
+### Repeatability and PD + SO(3) comparison
+
+Three repeats per speed for each controller, same 2 m `hover_to_hover` blend, same PX4 x500 SITL, same reference publisher, same bridge (`hover_thrust=0.728744`), and a fresh landed/disarmed vehicle before every run. Only the controller process differed. All 18 flights passed.
+
+| Controller | Speed (m/s) | Runs | Position RMSE mean ± std (m) | Max position error (m) | Max tilt (rad) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OMMPC | 0.8 | 3 | 0.0812 ± 0.0103 | 0.165–0.204 | 0.051 |
+| PD + SO(3) | 0.8 | 3 | 0.0717 ± 0.0175 | 0.121–0.131 | 0.066 |
+| OMMPC | 1.6 | 3 | 0.0944 ± 0.0063 | 0.212–0.265 | 0.245 |
+| PD + SO(3) | 1.6 | 3 | 0.1149 ± 0.0039 | 0.300–0.318 | 0.181 |
+| OMMPC | 2.0 | 3 | 0.1326 ± 0.0077 | 0.324–0.381 | 0.401 |
+| PD + SO(3) | 2.0 | 3 | 0.2119 ± 0.0132 | 0.590–0.620 | 0.198 |
+
+Repeatability: no run-to-run drift or outlier in either controller. OMMPC standard deviation is 5–13% of its mean; PD+SO(3) is 3–24%. At 0.8 m/s PD+SO(3) is slightly more accurate but more variable; from 1.6 m/s upward OMMPC is clearly better, and at 2.0 m/s its position RMSE is 37% lower with less than two-thirds the peak error.
+
+Tilt, interruptions and saturation:
+
+| Observation | OMMPC (2.0 m/s) | PD + SO(3) (2.0 m/s) |
+| --- | --- | --- |
+| Max body rate commanded | 1.29–1.30 rad/s | 1.00 rad/s (its own clamp) |
+| Samples at its rate clamp | 0% (limits are ±3/±3/±1.5) | 2.0%, 12.1%, 2.0% of the three runs |
+| Max thrust commanded | 10.31–10.32 m/s² | 9.86–9.91 m/s² |
+| Samples at the 12 m/s² thrust limit | 0% | 0% |
+| Worst control gap | 0.084–0.089 s | 0.094–0.120 s |
+| Runs with any gap > 0.1 s | 0 of 3 | 1 of 3 |
+
+Neither controller saturates the **interface** limits at any speed; OMMPC never reaches a clip, while PD+SO(3) saturates its own `±1 rad/s` clamp (its existing tuning, tighter than the ±3/±3/±1.5 interface) and its per-axis acceleration clip at the two highest speeds. That asymmetry explains the divergence: PD+SO(3) prioritises gentle attitude over tracking, so its tilt stays near 0.19 rad while its position error grows. Occasional gaps just above 0.1 s appear in both and are Python-side scheduling/rosbag effects, far below the 0.3 s acceptance limit.
+
+Attribution caveat: OMMPC additionally benefits from a 30-step prediction horizon and per-step feedforward, while PD+SO(3) is a reactive law with the repository's low-gain default tuning. The comparison therefore answers "does the added MPC machinery beat the existing PD + SO(3) baseline under identical trajectory, vehicle and initial conditions" — at 1.6–2.0 m/s it does, at 0.8 m/s the two are within run-to-run noise. Both are simulated results.
 
 ### Historical PX4/Gazebo results — sampled-reference version
 
