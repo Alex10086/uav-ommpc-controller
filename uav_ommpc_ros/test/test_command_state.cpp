@@ -122,3 +122,69 @@ TEST(CommandStateLimits, QuadraticInverseThrustMappingRecoversExactRotorAccelera
   EXPECT_FALSE(state.accept(input(std::numeric_limits<double>::infinity()), kStart + 400ms));
   EXPECT_FALSE(state.fresh(kStart + 501ms));
 }
+
+TEST(RateCompensation, DisabledPreservesLinearPathAndEnabledLeavesYawThrustUnchanged)
+{
+  CommandState original(kSuperQuadraticLimits, 500ms);
+  uav_ommpc_ros::RateCompensationSettings settings;
+  settings.enabled = true;
+  CommandState compensated(kSuperQuadraticLimits, 500ms, settings);
+  ASSERT_TRUE(original.accept(input(12.0, 0.0, 0.0, -0.3), kStart));
+  ASSERT_TRUE(compensated.accept(input(12.0, 0.0, 0.0, -0.3), kStart));
+  ASSERT_TRUE(original.accept(input(12.0, 0.2, -0.2, -0.3), kStart + 20ms));
+  ASSERT_TRUE(compensated.accept(input(12.0, 0.2, -0.2, -0.3), kStart + 20ms));
+  EXPECT_FLOAT_EQ(original.command().body_rates[0], 0.2f);
+  EXPECT_FLOAT_EQ(compensated.command().body_rates[2], original.command().body_rates[2]);
+  EXPECT_FLOAT_EQ(compensated.command().throttle, original.command().throttle);
+  EXPECT_GT(compensated.command().body_rates[0], 0.2f);
+  EXPECT_LT(compensated.command().body_rates[1], -0.2f);
+  // A constant target converges to its gain correction, not an accumulating derivative.
+  for (int i = 2; i < 100; ++i)
+    ASSERT_TRUE(compensated.accept(input(12.0, 0.2, -0.2, -0.3), kStart + i * 20ms));
+  EXPECT_NEAR(compensated.command().body_rates[0], 0.2 / settings.gain[0], 1e-6);
+}
+
+TEST(RateCompensation, LimitsLeadBoostAndResetsOnExpiredLease)
+{
+  uav_ommpc_ros::RateCompensationSettings settings;
+  settings.enabled = true;
+  CommandState state(kLimits, 500ms, settings);
+  ASSERT_TRUE(state.accept(input(kGravity, -3.0, 3.0), kStart));
+  ASSERT_TRUE(state.accept(input(kGravity, 3.0, -3.0), kStart + 20ms));
+  EXPECT_FLOAT_EQ(state.command().body_rates[0], 3.0f);
+  EXPECT_FLOAT_EQ(state.command().body_rates[1], -3.0f);
+  EXPECT_TRUE(state.command().limited);
+  ASSERT_TRUE(state.accept(input(kGravity, -0.5, 0.5), kStart + 1s));
+  EXPECT_NEAR(state.command().body_rates[0], -0.5 / settings.gain[0], 1e-6);
+  EXPECT_FALSE(state.command().limited);
+}
+
+TEST(RateCompensation, RejectedInputDoesNotAffectFilterOrFreshness)
+{
+  uav_ommpc_ros::RateCompensationSettings settings;
+  settings.enabled = true;
+  CommandState state(kLimits, 500ms, settings), expected(kLimits, 500ms, settings);
+  ASSERT_TRUE(state.accept(input(kGravity, 0.1), kStart));
+  ASSERT_TRUE(expected.accept(input(kGravity, 0.1), kStart));
+  EXPECT_FALSE(state.accept(input(kGravity, std::numeric_limits<double>::quiet_NaN()), kStart + 10ms));
+  ASSERT_TRUE(state.accept(input(kGravity, -0.1), kStart + 20ms));
+  ASSERT_TRUE(expected.accept(input(kGravity, -0.1), kStart + 20ms));
+  EXPECT_FLOAT_EQ(state.command().body_rates[0], expected.command().body_rates[0]);
+  EXPECT_FALSE(state.accept(input(-1.0, 3.0), kStart + 500ms));
+  EXPECT_FALSE(state.fresh(kStart + 521ms));
+}
+
+TEST(RateCompensation, InvalidSettingsAreRejected)
+{
+  uav_ommpc_ros::RateCompensationSettings settings;
+  settings.filter_time_constant = 0.0;
+  EXPECT_THROW((CommandState(kLimits, 500ms, settings)), std::invalid_argument);
+  settings.filter_time_constant = 0.012;
+  settings.gain[0] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_THROW((CommandState(kLimits, 500ms, settings)), std::invalid_argument);
+  settings.gain[0] = std::numeric_limits<double>::denorm_min();
+  EXPECT_THROW((CommandState(kLimits, 500ms, settings)), std::invalid_argument);
+  settings.gain[0] = 1.056;
+  settings.time_constant[1] = -0.1;
+  EXPECT_THROW((CommandState(kLimits, 500ms, settings)), std::invalid_argument);
+}

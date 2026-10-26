@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_command_ack.hpp>
@@ -43,6 +44,25 @@ public:
     const auto quadratic_thrust_model = declare_parameter<bool>("quadratic_thrust_model", false);
     const auto min_motor_speed = declare_parameter<double>("min_motor_speed", 150.0);
     const auto max_motor_speed = declare_parameter<double>("max_motor_speed", 1000.0);
+    // Startup-only: changing filter state/gains in flight is not a supported switch.
+    rcl_interfaces::msg::ParameterDescriptor compensation_descriptor;
+    compensation_descriptor.read_only = true;
+    uav_ommpc_ros::RateCompensationSettings compensation;
+    compensation.enabled = declare_parameter<bool>(
+      "rate_compensation_enabled", false, compensation_descriptor);
+    const auto gains = declare_parameter<std::vector<double>>(
+      "rate_compensation_gain", {compensation.gain[0], compensation.gain[1]}, compensation_descriptor);
+    const auto time_constants = declare_parameter<std::vector<double>>(
+      "rate_compensation_time_constant",
+      {compensation.time_constant[0], compensation.time_constant[1]}, compensation_descriptor);
+    if (gains.size() != 2 || time_constants.size() != 2)
+      throw std::invalid_argument("rate compensation gain/time_constant require [roll, pitch]");
+    for (std::size_t axis = 0; axis < 2; ++axis) {
+      compensation.gain[axis] = gains[axis];
+      compensation.time_constant[axis] = time_constants[axis];
+    }
+    compensation.filter_time_constant = declare_parameter<double>(
+      "rate_compensation_filter_time_constant", compensation.filter_time_constant, compensation_descriptor);
     const auto rate = declare_parameter<double>("rate", 50.0);
     const auto timeout = declare_parameter<double>("command_timeout", 0.5);
     const auto target_system = declare_parameter<std::int64_t>("target_system", 1);
@@ -86,7 +106,7 @@ public:
         min_motor_speed,
         max_motor_speed},
       std::chrono::duration_cast<CommandState::Clock::duration>(
-        std::chrono::duration<double>(timeout)));
+        std::chrono::duration<double>(timeout)), compensation);
 
     const auto reliable = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
     const auto telemetry = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();

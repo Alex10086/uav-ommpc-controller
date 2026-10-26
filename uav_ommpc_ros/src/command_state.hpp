@@ -9,6 +9,8 @@
 
 #include <uav_ommpc_interfaces/msg/thrust_rates.hpp>
 
+#include "roll_pitch_compensation.hpp"
+
 namespace uav_ommpc_ros
 {
 constexpr double kGravity = 9.80665;
@@ -50,8 +52,9 @@ class CommandState
 public:
   using Clock = std::chrono::steady_clock;
 
-  CommandState(const Limits & limits, Clock::duration timeout)
-  : limits_(limits), timeout_(timeout) {}
+  CommandState(const Limits & limits, Clock::duration timeout,
+    const RateCompensationSettings & compensation = {})
+  : limits_(limits), timeout_(timeout), compensation_(compensation) {}
 
   bool accept(const uav_ommpc_interfaces::msg::ThrustRates & input, Clock::time_point now)
   {
@@ -62,11 +65,17 @@ public:
       return false;
     }
     RateCommand command;
+    const double dt = compensation_.enabled() && last_accepted_ && now > *last_accepted_ &&
+      now - *last_accepted_ <= timeout_ ?
+      std::chrono::duration<double>(now - *last_accepted_).count() : 0.0;
     for (std::size_t axis = 0; axis < 3; ++axis) {
       const double limit = limits_.max_body_rates[axis];
-      const double rate = std::clamp(input.body_rates[axis], -limit, limit);
-      command.limited |= rate != input.body_rates[axis];
-      command.body_rates[axis] = static_cast<float>(rate);
+      const double desired = std::clamp(input.body_rates[axis], -limit, limit);
+      double rate = desired;
+      if (compensation_.enabled() && axis < 2)
+        rate = compensation_.apply(axis, desired, dt);
+      command.limited |= desired != input.body_rates[axis] || rate < -limit || rate > limit;
+      command.body_rates[axis] = static_cast<float>(std::clamp(rate, -limit, limit));
     }
     const double throttle = compute_throttle(limits_, input.thrust_acceleration);
     command.limited |= throttle < 0.0 || throttle > limits_.max_throttle;
@@ -86,6 +95,7 @@ public:
 private:
   Limits limits_;
   Clock::duration timeout_;
+  RollPitchCompensation compensation_;
   RateCommand command_{};
   std::optional<Clock::time_point> last_accepted_;
 };

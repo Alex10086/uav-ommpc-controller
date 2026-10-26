@@ -20,8 +20,9 @@ from sitl_ommpc_test import Flight, start_bag, stop_bag
 
 
 class RateIdentification(Flight):
-    def __init__(self, out):
+    def __init__(self, out, step_validation=False):
         super().__init__(out, ['rate_identification'], vehicle='super')
+        self.step_validation = step_validation
         self.excitation_axis = None
         self.excitation_kind = None
         self.excitation_start = 0.0
@@ -39,7 +40,8 @@ class RateIdentification(Flight):
             'training': '24 s linear chirp, 0.4 to 6 Hz, 1 s cosine taper',
             'validation': '12 s independent alternating rate doublets',
             'amplitudes_rad_s': [0.22, 0.22, 0.18],
-            'no_delay_compensation': True}
+            'step_validation': step_validation,
+            'compensation_settings_source': 'experiment manifest and bridge parameter snapshot'}
 
     def on_raw(self, raw):
         t = time.monotonic() - self.excitation_start
@@ -58,7 +60,13 @@ class RateIdentification(Flight):
         sent.thrust_acceleration = raw.thrust_acceleration
         rates = np.asarray(raw.body_rates, dtype=float).copy()
         if axis is not None:
-            rates[axis] += addition
+            if (self.step_validation and self.excitation_kind == 'doublet' and
+                    not self.f_landing and 0.0 <= t < 12.0 and t % 2.0 < 0.8):
+                # Direct, constant 300 ms rate plateaus permit actual step-overshoot measurement.
+                # OMMPC resumes this axis for the remainder of each 2 s cycle.
+                rates[axis] = addition
+            else:
+                rates[axis] += addition
         if not np.all(np.isfinite(rates)) or np.any(np.abs(rates) > [3., 3., 1.5]):
             self.injection_error = 'Excitation would exceed rate limits; no clipped identification input'
             return
@@ -99,10 +107,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--confirm-sitl', required=True, action='store_true')
     parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--step-validation', action='store_true')
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     rclpy.init()
-    flight = RateIdentification(args.output_dir)
+    flight = RateIdentification(args.output_dir, step_validation=args.step_validation)
     bag = log = None
     try:
         bag, log = start_bag(args.output_dir)
