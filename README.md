@@ -886,6 +886,86 @@ not demonstrate a universal tracking improvement or establish causal error
 fractions. Mapping groups ran sequentially rather than randomized/interleaved.
 
 
+#### SUPER rate-response identification before delay compensation
+
+`tools/sitl_rate_identification.py` is a simulator-only additive excitation relay.
+OMMPC output is remapped to `/uav/sysid/raw_control`; the relay forwards each new
+command once to `/uav/control_input`, adding excitation to one axis at a time.
+It never repeats stale commands or clips the identification input to manufacture
+an apparently valid experiment. Production controller/bridge code and Q/R/N are
+unchanged. Quadratic thrust mapping remains enabled for these runs.
+
+After a normal 2 m takeoff and settled hover, each axis receives a 24 s chirp
+from 0.4 to 6 Hz, followed by independent 12 s alternating doublets (0.3 s positive,
+0.3 s negative, 1.4 s zero). Chirp edges have a 1 s cosine taper. Injected roll/
+pitch amplitudes are 0.22 rad/s and yaw amplitude is 0.18 rad/s; the **total**
+setpoint also contains OMMPC feedback and is the input used for identification.
+Existing 0.6 rad tilt, 2 m position-error and freshness aborts remain enabled.
+This is closed-loop small-signal identification, not a high-rate/aggressive-flight
+qualification or a real-hardware experiment.
+
+Reproduce in a simulator-only ROS domain with existing DDS/GCS tmux windows:
+
+```bash
+source ~/ros2-px4-env.bash
+source ~/uav_control_ws/install/setup.bash
+python3 tools/run_rate_identification.py --confirm-sitl --repeats 3 \
+  --output-root ~/uav_control_ws/ommpc-flight-results/NEW_RATE_ID
+
+# This Jetson has pyulog in the PX4 venv and scipy/numpy in system dist-packages.
+PYTHONPATH=/usr/lib/python3/dist-packages ~/.venvs/px4-v1.17/bin/python \
+  tools/analyze_rate_identification.py \
+  ~/uav_control_ws/ommpc-flight-results/NEW_RATE_ID
+```
+
+Observed campaign: `~/uav_control_ws/ommpc-flight-results/rate-id-01/r{1,2,3}`.
+All three flights completed with native landing/disarm and zero ULog dropouts.
+Maximum whole-flight tilt was 0.0731, 0.0912 and 0.0668 rad respectively.
+Each directory retains `px4.ulg`, ROS bag, `excitation.csv`, flight CSV/JSON,
+controller snapshot/hash, and aligned per-axis chirp/doublet CSVs.
+Root `identification.json` retains all fitted candidate models and validation
+scores; `transport_timing.json` contains separate ROS-side timing observations.
+
+Input is ULog `vehicle_rates_setpoint` on its recorded timestamp; output is
+`vehicle_angular_velocity.xyz` on `timestamp_sample`, **not differentiated attitude**.
+The input interval is about 20 ms and gyro interval 8–12 ms. DDS conversion
+subtracts the synchronized offset and clamps future setpoint timestamps to PX4
+receipt time. Consequently the fitted delay is an effective timestamp-to-filtered-
+gyro delay, not an independently isolated motor delay. ROS phase boundaries are
+mapped using `timesync_status`; internal input/output fitting stays on PX4 time.
+
+| Axis | Selected model | Gain K, mean | Delay L, three runs (ms) | Dynamics, three runs | Held-out doublet fit (%) |
+| --- | --- | ---: | --- | --- | --- |
+| Roll | K exp(-Ls)/(Ts+1) | 1.0557 | 17.93 / 12.67 / 16.51 | T=27.12 / 28.26 / 27.16 ms | 93.66 / 96.95 / 96.63 |
+| Pitch | K exp(-Ls)/(Ts+1) | 1.0559 | 16.32 / 12.72 / 12.79 | T=26.31 / 28.51 / 27.69 ms | 96.58 / 96.05 / 96.90 |
+| Yaw | K wn² exp(-Ls)/(s²+2*zeta*wn*s+wn²) | 1.0492 | 15.96 / 15.45 / 18.19 | wn=9.295 / 9.297 / 9.284 rad/s; zeta≈0.489 | 98.63 / 99.09 / 99.16 |
+
+Fit is `100*(1-||y-yhat||/||y-mean(y)||)`, not classification accuracy or R².
+Models were fitted on chirps only; doublets were not used in fitting.
+The r1 model transferred without refitting to r2/r3 doublets with fit ranges
+94.45–96.78% (roll), 96.23–97.10% (pitch), 97.65–98.90% (yaw).
+Roll/pitch second-order candidates improve validation only slightly, so the
+first-order form is preferred for simplicity. Yaw first-order validation was
+only 77.86–78.95%; its delay-only candidate hit the 120 ms search bound and is
+not an identified 120 ms physical delay. The yaw second-order response is
+required to represent its underdamped dynamics.
+
+Do not implement a universal 50 ms pure-delay shift from the previous correlation
+estimate: roll/pitch low-frequency lag includes about 27.5 ms of dynamics **in
+addition to** approximately 14–16 ms of fitted delay. Yaw is substantially slower.
+The apparent relay-output-to-bridge-stamp median waits were 1.86 / 11.20 / 2.21 ms;
+the apparent odometry-sample-to-bag-receipt median ages were 35.21 / 11.96 / 15.16 ms.
+These ROS-side values include synchronization/recording effects, not just network
+transport. Whole-flight timesync offset excursions were 14.62 / 2.38 / 5.19 ms.
+Do not add these medians into a fixed compensation constant.
+
+Fine-grid fitted decimals are not sub-millisecond certainty. Sampling, DDS clock
+translation/clamping and delay-vs-lag model ambiguity require sensitivity checks
+on the order of 5–10 ms before compensation. Three runs provide repeatability,
+not a formal confidence interval. Direct closed-loop fitting may retain feedback/
+noise bias; independent doublets and cross-flight validation reduce but do not
+eliminate this risk. No delay compensation has been implemented by this experiment.
+
 ### Historical PX4/Gazebo results — sampled-reference version
 
 Successful evidence directories on Jetson:
