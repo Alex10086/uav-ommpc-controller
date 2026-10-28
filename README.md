@@ -390,7 +390,7 @@ This is a clean wire-interface cutover: the sampled `ReferenceState`/`ReferenceT
 - `header.frame_id` must be `"ned"` and positions use the same local NED origin as odometry. ENU plans must be transformed upstream, not merely relabeled.
 - `header.stamp` is the ROS time of the first segment. Republishing the same plan renews its receipt watchdog **without changing that stamp**. A shifted rolling window must update both its coefficients and its start stamp.
 - New plans are validated/decoded once on receipt and cached immutably. A malformed replacement clears the previous plan; unsupported degree, discontinuous derivatives, nonfinite values and invalid terminal holds are rejected.
-- Each accepted odometry packet records its **ROS reception time**. The node pairs that state with reference samples at reception time plus `k*dt`, without floor indexing. Message sample timestamps are used for ordering checks, not prediction anchoring. With DDS time synchronization enabled, both PX4 timestamp fields are translated to the agent/host clock; they are not raw boot times. This controller still does not compensate transport delay before receipt or predict an old state forward using an assumed actuator input.
+- Each accepted odometry packet records its **ROS reception time**. By default, the node pairs the unmodified state with references at reception time plus `k*dt`, without floor indexing. Optional `state_prediction_enabled` extrapolates measured position/attitude to solve start and samples the reference at that same anchor; see the peak-error audit below. With DDS synchronization enabled, both PX4 timestamp fields are translated to the agent/host clock, not raw boot time.
 - Current time, the odometry reception anchor, steady-clock freshness and geometry validity are checked. Future plans wait; expired non-holding plans stop. A complete N-step horizon is required. An explicitly stationary hold may extend beyond the final segment while the receipt lease remains fresh.
 - An odometry receipt stamp within **one control period** before the plan start is treated as plan time zero instead of being rejected. This absorbs publisher/subscriber clock skew and scheduling jitter without pretending to know the transport delay; anything older is still refused.
 - Keep the existing default `reference_timeout=0.5 s` by periodically renewing the plan. A long geometric duration or `hold_final=true` is not permission to continue after losing the planner. Planner/controller ROS clocks must be consistent.
@@ -417,8 +417,8 @@ This is an explicit hover target, not automatic takeoff or origin selection. For
 
 - Odometry pose frame must be `POSE_FRAME_NED`. Velocity may be `VELOCITY_FRAME_NED`, or `VELOCITY_FRAME_BODY_FRD`, in which case it is rotated by the body-to-world attitude. Arbitrary-heading FRD navigation frames and unknown frames are rejected; no ENU/FLU conversion is performed.
 - Odometry position, velocity and quaternion must be finite. Quaternion norm must be within `1e-3` of one; accepted float32 PX4 quaternions are normalized. Polynomial attitude is computed from analytic acceleration/jerk/yaw instead of received reference quaternions.
-- The installed PX4 message labels `quality` as unused; its default zero is **not** used to reject otherwise valid odometry. Measured angular velocity and covariance are not consumed by this p/v/R model.
-- PX4 `timestamp_sample` must be positive, no greater than the message timestamp, and strictly advance before refreshing the odometry cache. Status timestamps must also advance. The control gate does not compare these message stamps with ROS wall time; diagnostics record both to measure age when DDS synchronization is enabled. Duplicates/out-of-order packets do not refresh freshness. Restart the node if the source clock restarts or moves backward.
+- The installed PX4 message labels `quality` as unused; its default zero is **not** used to reject otherwise valid odometry. The pure p/v/R MPC does not include angular-rate states or covariance. Optional initial-state prediction uses finite measured body angular velocity; covariance remains unused.
+- PX4 `timestamp_sample` must be positive, no greater than the message timestamp, and strictly advance before refreshing the odometry cache. Status stamps must also advance. The default control path does not compare message stamps with ROS wall time. With prediction enabled, the sample must be in the synchronized ROS clock domain and have age in `[0,state_prediction_max_age]` at control use; invalid/future/too-old samples stop publication, without clamping or a guessed clock offset. Duplicates/out-of-order packets do not refresh freshness. Restart the node after source-clock reset/backward movement.
 - Fresh valid odometry, fresh reference receipt and fresh healthy vehicle status are all required. Vehicle status must report rotary-wing operation, not a VTOL transition, no failsafe and no termination mode. A fresh invalid odometry packet invalidates the cached state rather than continuing on its old value.
 - A changed odometry `reset_counter` invalidates the cached reference. The planner must publish a new trajectory in the updated local frame; the node cannot determine whether the planner actually corrected its origin. A backward ROS clock jump also invalidates the reference.
 - Malformed polynomial metadata/coefficients invalidate the old plan. Invalid geometry, unavailable full horizons, excessive dynamics defects, out-of-bound feedforward or solver failure produce **no control message**. No zero-thrust or last-solution fallback is generated.
@@ -679,7 +679,7 @@ The runner writes `result.json`, aggregate `trace.csv`, phase JSON/CSV, analytic
 
 `--record-bag` records 13 reference/telemetry/control/command/acknowledgement topics into `bag/` and closes the recorder via SIGINT with bounded cleanup. Check `rosbag.log` and `ros2 bag info RUN_DIR/bag`. Bags include command topics: **never replay them into a live aircraft or an active control domain**. Analyze offline or use an isolated domain and explicit non-command topic selection.
 
-The node writes per-solve iteration/status and timing to `solve_trace_path` (default `/tmp/ommpc_solve_trace.csv`). The flight runner copies the flight interval to `solve_timing.csv`. Fields also include solve-finish ROS nanoseconds, odometry receipt nanoseconds, DDS publication/sample microseconds, steady-clock wait from receipt to solve start, and reference start. This is a diagnostic trace, not a new ROS topic or delay-compensation mechanism.
+The node writes per-solve iteration/status and timing to `solve_trace_path` (default `/tmp/ommpc_solve_trace.csv`). The flight runner copies the flight interval to `solve_timing.csv`. Fields include solve-finish ROS nanoseconds, odometry receipt nanoseconds, DDS publication/sample microseconds, steady-clock wait, reference start/anchor, prediction duration and reference/planned input components. `planned_*` is the QP solution **before** the publication safety recheck, not proof that it reached PX4. Actual-command analysis retains bag/ULog matching. This trace is not a new ROS topic.
 
 ### Observed PX4/Gazebo results — polynomial version
 
@@ -1384,6 +1384,184 @@ and exact parameter differences. `baseline_comparison.json` preserves both
 full/moving metrics and peak/timing evidence; each flight retains its complete
 ULog, rosbag, CSV and peak-window plots. The corrected default remains
 SUPER-SITL-only; real GPS latency still requires measurement.
+
+##### Peak-error audit and optional measured-state prediction
+
+`tools/analyze_state_prediction.py` and `tools/analyze_peak_control.py` audit
+the corrected 0 ms baseline before any further controller change. They reuse
+the native-clock mapping and fixed pre-arm origin. Output lives outside Git:
+`timing-corrected-20261028/<case>/diagnostics` and the campaign's
+`peak-control/` directory. Main tracking errors are never shifted to minimize
+them.
+
+Findings from the original four turning flights:
+
+- Moving state-position error at control use fell from about 0.088/0.082 to
+  0.060/0.064 m in S-curve, and 0.081/0.067 to 0.074/0.062 m in Sharp3D,
+  when replaying constant-velocity position and measured-rate attitude
+  extrapolation. Roll/Pitch SO(3)-error components also improved.
+  This is an offline **state-error** comparison, not a predicted tracking
+  improvement. Past-command thrust acceleration helped velocity prediction
+  in S-curve but not consistently in Sharp3D, so it was not included.
+- Native command-to-gyro effective lag in peak windows was roughly 30–52 ms
+  for Roll/Pitch. Yet total commands already led reference feedforward on
+  dominant axes by roughly 36–100 ms in diagnostic correlations. The QP
+  correction includes state error, nominal discretization defects and horizon
+  anticipation (`free_response=H*x0+D`); `command-reference` is **not isolated
+  feedback**. No separate feedforward advance was added.
+- Fixed straight-line drag coefficient 0.079 s^-1 predicts lateral RMS of
+  only about 0.146 m/s² in Sharp3D peak windows versus observed projected
+  residual 0.90–1.00 m/s², with poor fits. Straight cruise supports approximately
+  0.080–0.081 s^-1. Rotational dynamics, callback timestamps and numerical
+  differentiation remain confounded; the full turning residual is not called
+  drag. Gazebo truth velocity itself comes from backward position differences.
+- Input bounds were not active in the four original turn phases. The discrete
+  reference defects were about 0.68–0.86 mm position per step, not an explanation
+  by themselves of the 20–26 cm flight peaks.
+
+Native setpoint-to-bag matching uses exact float32 payloads, rejecting ambiguous
+repeated payloads rather than choosing the nearest. Command-to-solve association
+still has no explicit solve ID: it accepts only one successful completion in
+the preceding 10 ms, one-to-one. The original turn windows had 99/99 matched
+grid samples; low-excitation straight data can be ambiguous and is reported
+as such. New traces supply the exact reference anchor and reference inputs;
+`planned_*` never substitutes for an actually matched applied command.
+
+The new `uav_ommpc_ros/src/state_prediction.hpp` applies only:
+
+```text
+age = ROS_solve_start - synchronized_odometry_sample
+p_used = p_sample + age * v_sample
+v_used = v_sample
+R_used = R_sample * Exp(age * measured_body_rates)
+reference[k] = reference(ROS_solve_start + k*dt)
+```
+
+It does not use ideal commanded rates as measured gyro, infer acceleration,
+change the MPC dynamics/Q/R/N, compensate actuator delay, or modify thrust/yaw
+mapping. State and reference anchors change together; this experiment does not
+separately identify their individual contributions. Every cycle predicts from
+the cached **raw** measurement, never recursively from the previous prediction.
+Fixed-size Eigen state and stack storage avoid per-cycle allocation.
+
+Startup-only ROS parameters:
+
+- `state_prediction_enabled=false` preserves the original path.
+- `state_prediction_max_age=0.08` seconds bounds extrapolation and must not
+  exceed `odometry_timeout` when enabled.
+
+```bash
+ros2 run uav_ommpc_ros ommpc_node --ros-args \
+  --params-file ~/uav_control_ws/src/uav-ommpc-controller/uav_ommpc_ros/config/ommpc_super_sitl.yaml \
+  -p state_prediction_enabled:=true
+
+python3 tools/run_rate_compensation_ab.py --confirm-sitl --suite state-prediction \
+  --repeats 3 --output-root ~/uav_control_ws/ommpc-flight-results/NEW_STATE_AB
+```
+
+The suite alternates prediction OFF/ON order on successive repetitions, with
+GPS delay 0 ms and bridge rate compensation OFF throughout. Optional `--cases`
+selects the existing straight-line controls. The aggregator groups prediction
+and bridge compensation flags separately, never pooling OFF/ON state modes.
+The timing report distinguishes the raw held-state error from the actually
+extrapolated controller-input error at its anchor and at solve finish.
+
+The Release build and ROS package tests passed (`30 tests, 0 failures`).
+An isolated real-node smoke exercised both paths, checked the logged anchor
+invariants, and verified that future-at-use stamps/nonfinite gyro stop output
+in prediction mode while the default bypass remains unchanged.
+The analysis tests passed (13 existing timing/projection tests plus 6 new
+matching/lag/reference-boundary tests). Reference reconstruction mirrors the
+node's one-period prestart tolerance; it does not suppress invalid times or
+apply a best-fit shift.
+
+One later validation launch timed out before the flight runner started:
+Gazebo from a previously landed flight had survived shutdown. Its log and
+`startup_failure.json` are retained in `peak-state-validation-20261028`.
+The shared shutdown now waits for the **owned process group**, escalating
+SIGINT→SIGTERM→SIGKILL only after confirmed landing; it does not stop unrelated
+process groups. A real isolated-process regression covered a signal-resistant
+orphan and verified that an unrelated process stayed alive. Recovery runs use
+a separate evidence root instead of overwriting the failed launch.
+
+**Repeated validation did not establish a general tracking improvement.
+State prediction remains default-OFF; it is not adopted as the new SUPER
+baseline.** The favorable first pair was retained, but so were the adverse
+repeats and straight-line regression.
+
+Evidence roots under `~/uav_control_ws/ommpc-flight-results`:
+
+- `peak-state-pilot-20261028`: 4 completed pilot flights and the combined
+  `tracking_comparison.json` / `final_state_comparison.json`.
+- `peak-state-validation-20261028`: 3 completed flights and 1 pre-flight
+  simulator-startup failure, preserved separately.
+- `peak-state-recovery-20261028`: 9 completed recovery/repeat/control flights.
+
+Total: **16 completed, landed/disarmed flights**, plus the one startup failure
+(not counted as a successful flight). Each turn case has 3 OFF and 3 ON runs;
+each straight control has only one OFF/ON pair. GPS delay is 0 ms, bridge rate
+compensation is OFF, and every controller snapshot has SHA256
+`a7d3708d5b7d10a99b5cbe9e39fad7a9fed13e5ad9ed992ea221c2c5e8f5098b`.
+Logged prediction durations and reference anchors were checked against the
+actual sample timestamps; OFF retains the exact receipt-time anchor.
+
+Native-clock truth results (mean of per-run metrics; `worst peak` is the
+largest individual run peak, not the mean of peaks):
+
+| Case | Full-phase position RMSE OFF→ON (m) | Moving-only RMSE OFF→ON (m) | Mean peak OFF→ON (m) | Worst peak OFF→ON (m) |
+| --- | --- | --- | --- | --- |
+| S-curve, 3.9 m/s, n=3 per mode | 0.0847→0.0943 | 0.1031→0.1141 | 0.1874→0.1970 | 0.2172→0.2113 |
+| Sharp3D, 3.85 m/s, n=3 per mode | 0.0915→0.0830 | 0.1137→0.1065 | 0.2469→0.2275 | 0.2938→0.2432 |
+| Straight, 1.0 m/s, n=1 per mode | 0.0462→0.0383 | 0.0508→0.0406 | 0.0906→0.0831 | 0.0906→0.0831 |
+| Straight, 3.9 m/s, n=1 per mode | 0.0580→0.0691 | 0.0540→0.0604 | 0.1171→0.1098 | 0.1171→0.1098 |
+
+The third Sharp3D pair reversed the pilot benefit: peak 0.1875→0.2420 m.
+The third S-curve pair also worsened: 0.1485→0.2113 m. Thus lower worst-case
+values in the small aggregate are not proof of a repeatable peak reduction.
+Do not retune gains to the favorable pilot or describe this as universally
+improved tracking.
+
+Prediction reduced controller-input position error at solve finish on average:
+0.0806→0.0684 m in S-curve and 0.0809→0.0522 m in Sharp3D, but this did not
+guarantee smaller trajectory error. Moving tangent RMSE fell
+0.0741→0.0650 / 0.0836→0.0653 m, while cross-track RMSE increased
+0.0713→0.0933 / 0.0770→0.0836 m, respectively. This is not simply a trajectory
+that can be fixed by one time shift.
+
+Automatic barometer calibration differed in seven of the eight pairs, in
+addition to flight counters; no rate-loop/vehicle parameter changes were
+introduced. Horizontal-only RMSE shows the same mixed pattern:
+S-curve 0.0734→0.0843 m, Sharp3D 0.0871→0.0788 m.
+`parameter_comparison.json` and `horizontal_vertical_comparison.json` preserve
+the exact differences. Three turning repeats and single straight pairs do
+not establish confidence intervals or causal error percentages.
+
+All completed runs had zero recorded input-bound violations and zero ULog
+dropouts. Maximum observed tilt was 0.7162 rad, per-run mean solve time
+1.076–1.423 ms and worst solve 4.307 ms. Actual-node smoke, math tests and
+process-group regression passed; no claim is made of real-aircraft validation.
+One final Sharp3D ON peak window had 8/99 unmatched command-chain grid points:
+they remain gaps in feedforward/correction plots. Ground-truth tracking
+statistics do not depend on that command association.
+
+Decision: retain the original control path and the proven GPS timing fix.
+The remaining inner-loop discrepancy is independently observed, but the QP
+already advances total commands relative to nominal reference; adding another
+arbitrary FF lead risks double compensation. A subsequent controlled design
+should test explicit actual-rate dynamics and consistent velocity propagation
+in prediction. The straight-line drag evidence can inform a later consistent
+model/reference change, not an inflated coefficient fitted to all turn
+residuals. These are next-experiment priorities, not proven error shares.
+
+Reproduce the complete interrupted-campaign aggregation without mixing modes,
+double-counting paths, or pooling different controller/GPS-delay configurations:
+
+```bash
+ROOT=~/uav_control_ws/ommpc-flight-results
+python3 tools/analyze_rate_compensation_tracking.py "$ROOT/peak-state-pilot-20261028" \
+  --additional-root "$ROOT/peak-state-validation-20261028" \
+  --additional-root "$ROOT/peak-state-recovery-20261028"
+```
 
 ### Historical PX4/Gazebo results — sampled-reference version
 

@@ -21,7 +21,8 @@ LOG_ROOT = PX4/'build/px4_sitl_default/rootfs/log'
 ENV = 'source ~/ros2-px4-env.bash && source ~/uav_control_ws/install/setup.bash && '
 
 
-def nodes(experiment, rate_compensation=False, rate_filter=0.020, rate_gain=1.08):
+def nodes(experiment, rate_compensation=False, rate_filter=0.020, rate_gain=1.08,
+          state_prediction=False):
     for name in ['bridge', 'ommpc']:
         subprocess.run(['tmux', 'kill-window', '-t', 'sitl:'+name], capture_output=True)
     commands = {
@@ -30,17 +31,37 @@ def nodes(experiment, rate_compensation=False, rate_filter=0.020, rate_gain=1.08
                   f' -p rate_compensation_filter_time_constant:={rate_filter}' +
                   f' -p rate_compensation_gain:=\"[{rate_gain}, {rate_gain}]\"',
         'ommpc': f'ros2 run uav_ommpc_ros ommpc_node --ros-args --params-file {CONFIG}' +
+                 f' -p state_prediction_enabled:={str(state_prediction).lower()}' +
                  (' -r /uav/control_input:=/uav/sysid/raw_control' if experiment else '')}
     for name, cmd in commands.items():
         subprocess.run(['tmux', 'new-window', '-t', 'sitl', '-n', name, ENV+cmd], check=True)
     time.sleep(3)
 
 
-def stop_sim():
-    subprocess.run(['pkill', '-INT', '-x', 'px4'], capture_output=True)
-    time.sleep(2)
-    subprocess.run(['pkill', '-TERM', '-f', '[g]z sim'], capture_output=True)
-    time.sleep(2)
+def stop_sim(sim):
+    """After confirmed landing, stop only this launcher's process group."""
+    def live_members():
+        listing = subprocess.run(['ps', '-eo', 'pid=,pgid=,stat='],
+                                 check=True, capture_output=True, text=True)
+        return [int(pid) for pid, group, state in
+                (line.split() for line in listing.stdout.splitlines())
+                if int(group) == sim.pid and not state.startswith('Z')]
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        if not live_members():
+            return
+        if sig == signal.SIGKILL:
+            print(f'Escalating stopped-flight simulator group {sim.pid} to SIGKILL', flush=True)
+        try:
+            os.killpg(sim.pid, sig)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic()+3.0
+        while time.monotonic() < deadline:
+            if not live_members():
+                return
+            time.sleep(.1)
+    raise RuntimeError(f'Simulator process group {sim.pid} did not exit')
 
 
 def main():
@@ -99,11 +120,8 @@ def main():
                     'raw_control_topic': '/uav/sysid/raw_control', 'flight_returncode': result.returncode}
                 (case/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
                 print(json.dumps({'run': i, **manifest}), flush=True)
-                stop_sim()
-                try:
-                    sim.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(sim.pid, signal.SIGTERM)
+                stop_sim(sim)
+                sim.wait(timeout=10)
                 if result.returncode:
                     raise RuntimeError('Identification flight failed; evidence retained, no automatic retry')
     finally:

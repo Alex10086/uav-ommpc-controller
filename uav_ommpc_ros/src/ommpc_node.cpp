@@ -20,6 +20,7 @@
 #include <uav_ommpc_controller/ommpc.hpp>
 
 #include "ommpc_inputs.hpp"
+#include "state_prediction.hpp"
 
 namespace
 {
@@ -40,6 +41,10 @@ public:
     odometry_timeout_ = timeout_parameter("odometry_timeout", 0.2);
     status_timeout_ = timeout_parameter("status_timeout", 1.5);
     reference_timeout_ = timeout_parameter("reference_timeout", 0.5);
+    state_prediction_enabled_ = parameter("state_prediction_enabled", false);
+    state_prediction_max_age_ = timeout_parameter("state_prediction_max_age", 0.08);
+    if (state_prediction_enabled_ && state_prediction_max_age_ > odometry_timeout_)
+      throw std::invalid_argument("state_prediction_max_age must not exceed odometry_timeout");
     const auto trace_path = parameter<std::string>("solve_trace_path", "/tmp/ommpc_solve_trace.csv");
     if (!trace_path.empty())
     {
@@ -48,7 +53,10 @@ public:
       {
         solve_trace_ << "steady_s,solve_us,step_us,iterations,status,solver_status,"
                      << "finished_ros_ns,odometry_receipt_ros_ns,odometry_timestamp_us,"
-                     << "odometry_sample_us,state_wait_us,reference_start_ns\n";
+                     << "odometry_sample_us,state_wait_us,reference_start_ns,"
+                     << "reference_anchor_ros_ns,state_prediction_dt_s,"
+                     << "reference_thrust,reference_roll,reference_pitch,reference_yaw,"
+                     << "planned_thrust,planned_roll,planned_pitch,planned_yaw\n";
         solve_trace_ << std::fixed << std::setprecision(6);
         solve_trace_.flush();
       }
@@ -147,9 +155,20 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Rejected odometry frame or nonfinite/invalid pose");
       return;
     }
+    if (state_prediction_enabled_)
+    {
+      measured_body_rates_ = Eigen::Vector3d(message.angular_velocity[0],
+        message.angular_velocity[1], message.angular_velocity[2]);
+      if (!measured_body_rates_.allFinite())
+      {
+        odometry_at_.reset();
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Rejected nonfinite measured body rates");
+        return;
+      }
+    }
     odometry_at_ = Clock::now();
     odometry_timestamp_us_ = message.timestamp;
-    // Preserve receipt-time anchoring; diagnostics separately record the sample stamp.
+    // Original path remains receipt-anchored; optional prediction uses the sample stamp.
     odometry_ros_ns_ = get_clock()->now().nanoseconds();
   }
 
@@ -189,7 +208,14 @@ private:
     return at && now - *at <= std::chrono::duration<double>(timeout);
   }
 
-  std::optional<double> active_reference(Clock::time_point steady_now, std::int64_t ros_now_ns)
+  struct ReferenceAnchor
+  {
+    double elapsed;
+    double prediction_dt;
+    std::int64_t ros_ns;
+  };
+
+  std::optional<ReferenceAnchor> active_reference(Clock::time_point steady_now, std::int64_t ros_now_ns)
   {
     if (ros_now_ns < last_ros_ns_)
     {
@@ -200,17 +226,22 @@ private:
     if (!fresh(odometry_at_, odometry_timeout_, steady_now) ||
       !fresh(status_at_, status_timeout_, steady_now) || !status_healthy_ || !trajectory_ ||
       !fresh(reference_at_, reference_timeout_, steady_now)) return std::nullopt;
+    std::optional<double> prediction_dt = 0.0;
+    if (state_prediction_enabled_)
+      prediction_dt = uav_ommpc_ros::state_sample_age(last_sample_, ros_now_ns, state_prediction_max_age_);
+    if (!prediction_dt) return std::nullopt;
+    const auto anchor_ros_ns = state_prediction_enabled_ ? ros_now_ns : odometry_ros_ns_;
     const auto now_elapsed = uav_ommpc_ros::reference_elapsed(
       ros_now_ns, reference_start_ns_, period_.count());
-    const auto anchor_elapsed = uav_ommpc_ros::reference_elapsed(
-      odometry_ros_ns_, reference_start_ns_, period_.count());
+    const auto anchor_elapsed = state_prediction_enabled_ ? now_elapsed :
+      uav_ommpc_ros::reference_elapsed(anchor_ros_ns, reference_start_ns_, period_.count());
     if (!now_elapsed || !anchor_elapsed || odometry_ros_ns_ > ros_now_ns) return std::nullopt;
     dynamics::State state;
     dynamics::ControlInput input;
     // Validate both current geometry and the measured state's prediction anchor.
     if (!trajectory_->sample(*now_elapsed, state, input) ||
-      !trajectory_->sample(*anchor_elapsed, state, input)) return std::nullopt;
-    return anchor_elapsed;
+      (anchor_ros_ns != ros_now_ns && !trajectory_->sample(*anchor_elapsed, state, input))) return std::nullopt;
+    return ReferenceAnchor{*anchor_elapsed, *prediction_dt, anchor_ros_ns};
   }
 
   void record_solve_timing(
@@ -218,7 +249,7 @@ private:
     Clock::time_point solve_started,
     Clock::time_point solve_finished,
     Clock::time_point finished,
-    const mpc::Result &result)
+    const mpc::Result &result, const ReferenceAnchor &anchor)
   {
     if (!solve_trace_.is_open()) return;
     const double steady_s = std::chrono::duration<double>(finished.time_since_epoch()).count();
@@ -229,7 +260,16 @@ private:
                  << result.solver_status << ',' << get_clock()->now().nanoseconds() << ','
                  << odometry_ros_ns_ << ',' << odometry_timestamp_us_ << ',' << last_sample_ << ','
                  << std::chrono::duration<double, std::micro>(started - *odometry_at_).count() << ','
-                 << reference_start_ns_ << '\n';
+                 << reference_start_ns_ << ',' << anchor.ros_ns << ',' << anchor.prediction_dt << ','
+                 << reference_inputs_.front().thrust_acceleration;
+    for (int axis = 0; axis < 3; ++axis)
+      solve_trace_ << ',' << reference_inputs_.front().body_rates[axis];
+    const double missing = std::numeric_limits<double>::quiet_NaN();
+    // Planned QP output is not necessarily published: safety gates are rechecked below.
+    solve_trace_ << ',' << (result.command ? result.command->thrust_acceleration : missing);
+    for (int axis = 0; axis < 3; ++axis)
+      solve_trace_ << ',' << (result.command ? result.command->body_rates[axis] : missing);
+    solve_trace_ << '\n';
     if (++solve_count_ % 5 == 0 || result.status != mpc::Status::Solved)
       solve_trace_.flush();
   }
@@ -237,32 +277,35 @@ private:
   void control_step()
   {
     const auto started = Clock::now();
-    const auto elapsed = active_reference(started, get_clock()->now().nanoseconds());
-    if (!elapsed)
+    const auto anchor = active_reference(started, get_clock()->now().nanoseconds());
+    if (!anchor)
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Control paused: need fresh valid odometry/status and a current full reference horizon");
+        "Control paused: need fresh valid state/gyro/status and a synchronized sample stamp when prediction is enabled");
       return;
     }
-    if (!trajectory_->sample_horizon(*elapsed, settings_.dt, reference_states_, reference_inputs_))
+    if (!trajectory_->sample_horizon(anchor->elapsed, settings_.dt, reference_states_, reference_inputs_))
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
         "Control paused: polynomial cannot supply a valid full reference horizon");
       return;
     }
+    std::optional<dynamics::State> predicted;
+    if (state_prediction_enabled_)
+      predicted.emplace(uav_ommpc_ros::predict_measured_state(actual_, measured_body_rates_, anchor->prediction_dt));
     const auto solve_started = Clock::now();
-    const auto result = controller_->solve(actual_, reference_states_, reference_inputs_);
+    const auto result = controller_->solve(predicted ? *predicted : actual_, reference_states_, reference_inputs_);
     const auto solve_finished = Clock::now();
     if (result.status != mpc::Status::Solved || !result.command)
     {
-      record_solve_timing(started, solve_started, solve_finished, solve_finished, result);
+      record_solve_timing(started, solve_started, solve_finished, solve_finished, result, *anchor);
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
         "OMMPC produced no command: status=%d, OSQP=%d, iterations=%d",
         static_cast<int>(result.status), result.solver_status, result.iterations);
       return;
     }
     const auto finished = Clock::now();
-    record_solve_timing(started, solve_started, solve_finished, finished, result);
+    record_solve_timing(started, solve_started, solve_finished, finished, result, *anchor);
     // Ordinary reference sample boundary crossings are allowed. Bound solve
     // latency and recheck the lease/telemetry/domain, not a floor-grid index.
     if (finished - started > period_ ||
@@ -280,6 +323,9 @@ private:
   std::unique_ptr<mpc::Controller> controller_;
   std::chrono::nanoseconds period_{};
   double odometry_timeout_{}, status_timeout_{}, reference_timeout_{};
+  bool state_prediction_enabled_{false};
+  double state_prediction_max_age_{};
+  Eigen::Vector3d measured_body_rates_ = Eigen::Vector3d::Zero();
   std::ofstream solve_trace_;
   std::uint64_t solve_count_{};
   dynamics::State actual_;

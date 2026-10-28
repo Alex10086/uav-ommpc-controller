@@ -10,10 +10,8 @@ Requires existing simulator-only DDS/GCS tmux windows and sourced ROS overlays.
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import time
 
@@ -34,10 +32,10 @@ DIAGNOSTIC_CASES = {
 }
 
 
-def track(out, case, enabled, arguments=None, gps_delay_ms=None):
+def track(out, case, enabled, arguments=None, gps_delay_ms=None, state_prediction=False):
     if out.exists():
         raise FileExistsError(out)
-    nodes(False, enabled)
+    nodes(False, enabled, state_prediction=state_prediction)
     before=set(LOG_ROOT.rglob('*.ulg'))
     px4_log = out.parent / (out.name + '.px4.log')
     flight_log_path = out.parent / (out.name + '.flight.log')
@@ -82,6 +80,7 @@ def track(out, case, enabled, arguments=None, gps_delay_ms=None):
         shutil.copy2(CONFIG,out/'controller.yaml')
         (out/'manifest.json').write_text(json.dumps({
             'case':case,'rate_compensation_enabled':enabled,
+            'state_prediction_enabled':state_prediction,
             'trajectory_arguments':CASES[case] if arguments is None else arguments,
             'gps_delay_override_ms':gps_delay_ms,
             'gps_delay_ms':0.0 if gps_delay_ms is None else gps_delay_ms,
@@ -89,12 +88,8 @@ def track(out, case, enabled, arguments=None, gps_delay_ms=None):
             'filter_time_constant_s':.020,'quadratic_thrust_model':True,
             'controller_sha256':hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
             'returncode':rc},indent=2)+'\n')
-        stop_sim()
-        try:
-            sim.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(sim.pid,signal.SIGTERM)
-            sim.wait(timeout=10)
+        stop_sim(sim)
+        sim.wait(timeout=10)
     if saved_parameters:
         if subprocess.run(['pgrep', '-x', 'px4'], capture_output=True).returncode == 0:
             raise RuntimeError('PX4 still running; preserving parameter backup without restoring live files')
@@ -117,20 +112,31 @@ def track(out, case, enabled, arguments=None, gps_delay_ms=None):
 def main():
     cli=argparse.ArgumentParser(description=__doc__)
     cli.add_argument('--confirm-sitl',required=True,action='store_true')
-    cli.add_argument('--suite',choices=['rates','tracking','diagnostics'],required=True)
+    cli.add_argument('--suite',choices=['rates','tracking','diagnostics','state-prediction'],required=True)
     cli.add_argument('--output-root',type=Path,required=True)
     cli.add_argument('--repeats',type=int,default=3)
     cli.add_argument('--first-repeat',type=int,default=1)
     cli.add_argument('--cases', choices=tuple(DIAGNOSTIC_CASES), nargs='+',
-                     help='Diagnostic cases only; default runs all four')
+                     help='Diagnostic/prediction cases; prediction defaults to the two turn trajectories')
     cli.add_argument('--gps-delay-ms', type=float, choices=[0.0,110.0],
                      help='Diagnostic-only override of normal 0 ms; restores prior SITL parameters after shutdown')
     args=cli.parse_args()
     if args.repeats<1 or args.first_repeat<1:
         cli.error('repeat counts must be positive')
-    if (args.cases is not None or args.gps_delay_ms is not None) and args.suite != 'diagnostics':
-        cli.error('--cases and --gps-delay-ms require --suite diagnostics')
+    if args.cases is not None and args.suite not in ('diagnostics','state-prediction'):
+        cli.error('--cases requires --suite diagnostics or state-prediction')
+    if args.gps_delay_ms is not None and args.suite != 'diagnostics':
+        cli.error('--gps-delay-ms requires --suite diagnostics')
     args.output_root.mkdir(parents=True,exist_ok=True)
+    if args.suite == 'state-prediction':
+        for i in range(args.first_repeat, args.first_repeat + args.repeats):
+            for case in (args.cases or ['scurve-3.9', 'sharp3d-3.85']):
+                for predicted in ([False, True] if i % 2 else [True, False]):
+                    label = 'predicted' if predicted else 'original'
+                    track(args.output_root / f'{case}-{label}-r{i}', case, False,
+                          DIAGNOSTIC_CASES[case], state_prediction=predicted)
+        nodes(False, False)
+        return
     if args.suite == 'diagnostics':
         for i in range(args.first_repeat, args.first_repeat + args.repeats):
             for case in (args.cases or DIAGNOSTIC_CASES):

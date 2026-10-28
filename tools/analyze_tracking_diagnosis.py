@@ -189,6 +189,12 @@ def controller_evidence(directory, clock, odom, gt_t, gt_p, origin, begin, end):
     estimation = odom[at, 3:6]-sample_truth
     staleness = sample_truth-use_truth
     total = odom[at, 3:6]-use_truth
+    prediction_dt = np.array([float(r.get('state_prediction_dt_s', 0.0)) for r in rows])
+    anchor = np.array([int(r.get('reference_anchor_ros_ns', r['odometry_receipt_ros_ns']))*1e-9 for r in rows])
+    controller_position = odom[at, 3:6] + prediction_dt[:,None]*odom[at, 6:9]
+    anchor_truth = interpolate(clock.native(anchor), gt_t, gt_p)+origin
+    input_at_anchor_error = controller_position-anchor_truth
+    input_at_use_error = controller_position-use_truth
     evidence = {'available': True, 'samples': len(rows), 'exact_sample_match_fraction': float(np.mean(matched)),
                 'sample_to_estimator_publication_ms': summary((publication-stamp)*1000),
                 'publication_to_controller_receipt_ms': summary((receipt-publication)*1000),
@@ -200,15 +206,21 @@ def controller_evidence(directory, clock, odom, gt_t, gt_p, origin, begin, end):
                 'estimator_at_sample_position_rmse_m': rms(estimation[matched]),
                 'stale_motion_position_rmse_m': rms(staleness[matched]),
                 'held_state_at_use_position_rmse_m': rms(total[matched]),
+                'prediction_dt_ms': summary(prediction_dt*1000),
+                'reference_anchor_to_solve_finish_ms': summary((use-anchor)*1000),
+                'controller_input_at_anchor_position_rmse_m': rms(input_at_anchor_error[matched]),
+                'controller_input_at_use_position_rmse_m': rms(input_at_use_error[matched]),
                 'decomposition': 'held_estimate-truth(use) = estimation_error(sample) + truth(sample)-truth(use)',
                 'note': 'age uses translated DDS stamps; negative values expose sync uncertainty, not negative physical delay'}
     with (directory/'diagnostics'/f'controller_{begin:.6f}.csv').open('w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['native_use_s', 'native_sample_s', 'sample_age_ms', 'exact_sample_match',
-                    'estimation_error_m', 'stale_motion_m', 'held_state_error_m'])
+                    'estimation_error_m', 'stale_motion_m', 'held_state_error_m',
+                    'controller_input_error_at_anchor_m','controller_input_error_at_use_m','prediction_dt_s'])
         w.writerows(zip(native_use, native_sample, (use-stamp)*1000, matched,
                         np.linalg.norm(estimation, axis=1), np.linalg.norm(staleness, axis=1),
-                        np.linalg.norm(total, axis=1)))
+                        np.linalg.norm(total, axis=1),np.linalg.norm(input_at_anchor_error,axis=1),
+                        np.linalg.norm(input_at_use_error,axis=1),prediction_dt))
     return evidence, (clock.native(curve_use), (curve_use-curve_sample)*1000)
 
 
