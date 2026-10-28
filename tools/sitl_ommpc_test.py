@@ -41,7 +41,8 @@ TRACE_FIELDS = ('time_s phase px4_timestamp_us north_m east_m down_m vn_m_s '
                 'velocity_error_m_s speed_m_s tilt_rad yaw_error_rad '
                 'input_thrust_m_s2 input_roll_rad_s input_pitch_rad_s input_yaw_rad_s '
                 'bridge_roll_rad_s bridge_pitch_rad_s bridge_yaw_rad_s bridge_thrust_z '
-                'input_age_s rates_age_s state_age_s status_age_s nav_state arming_state').split()
+                'input_age_s rates_age_s state_age_s status_age_s nav_state arming_state '
+                'state_receipt_ros_ns px4_sample_us').split()
 SOLVE_TRACE_PATH = Path('/tmp/ommpc_solve_trace.csv')
 
 
@@ -78,6 +79,7 @@ def load_solve_trace():
             for row in csv.DictReader(handle):
                 try:
                     rows.append({
+                        **row,
                         'steady_s': float(row['steady_s']),
                         'solve_us': float(row['solve_us']),
                         'step_us': float(row['step_us']),
@@ -316,7 +318,8 @@ class Flight(ReferencePublisher):
                error, velocity_error, speed, tilt, yaw_error, *control, *rates[:3], rates[5],
                now-self.f_input_at, now-self.f_rates_at, now-self.f_state_at, now-self.f_status_at,
                int(self.f_status.nav_state) if self.f_status else -1,
-               int(self.f_status.arming_state) if self.f_status else -1]
+               int(self.f_status.arming_state) if self.f_status else -1,
+               self.f_state_ros_ns, int(state.timestamp_sample)]
         self.f_rows.append(dict(zip(TRACE_FIELDS, row)))
         self.f_trace_writer.writerow(row)
 
@@ -370,9 +373,11 @@ class Flight(ReferencePublisher):
     def f_phase_start(self, name):
         if self.f_phase in self.f_phase_info:
             self.f_phase_info[self.f_phase]['end_s'] = self.f_time()
+            self.f_phase_info[self.f_phase]['ros_end_ns'] = self.get_clock().now().nanoseconds
             self.f_phase_info[self.f_phase]['counts_end'] = self.f_counts.copy()
         self.f_phase = name
         self.f_phase_info[name] = {'start_s': self.f_time(), 'completed': False,
+                                   'ros_start_ns': self.get_clock().now().nanoseconds,
                                    'counts_start': self.f_counts.copy()}
         print(f'[{self.f_time():7.2f}s] {name}', flush=True)
         for file in self.f_files:
@@ -381,6 +386,7 @@ class Flight(ReferencePublisher):
     def f_phase_done(self):
         self.f_phase_info[self.f_phase]['completed'] = True
         self.f_phase_info[self.f_phase]['end_s'] = self.f_time()
+        self.f_phase_info[self.f_phase]['ros_end_ns'] = self.get_clock().now().nanoseconds
         self.f_phase_info[self.f_phase]['counts_end'] = self.f_counts.copy()
         print(json.dumps(self.f_metrics(self.f_phase)), flush=True)
 
@@ -767,7 +773,7 @@ class Flight(ReferencePublisher):
             run_solves = [s for s in self.f_solve_rows if start_steady <= s['steady_s'] <= end_steady]
             if run_solves:
                 with (self.f_out/'solve_timing.csv').open('w', newline='') as file:
-                    writer = csv.DictWriter(file, ['steady_s', 'solve_us', 'step_us', 'iterations', 'status', 'solver_status'])
+                    writer = csv.DictWriter(file, list(run_solves[0]))
                     writer.writeheader()
                     writer.writerows(run_solves)
         self.f_result.update({'duration_s': self.f_time(), 'last_phase': self.f_phase,
@@ -828,6 +834,8 @@ def main():
     parser.add_argument('--record-bag', action='store_true', help='Record essential reference/state/status/control/PX4 topics')
     parser.add_argument('--speed', type=float, default=None, help='Target speed for moving modes')
     parser.add_argument('--offset', type=float, nargs=3, default=None, help='Displacement offset N E D for target_step/hover_to_hover')
+    parser.add_argument('--direction', type=float, nargs=3, default=None,
+                        help='Straight-line direction N E D (normalized by trajectory generator)')
     parser.add_argument('--radius', type=float, default=None, help='Radius (m) for circle/figure8/helix')
     parser.add_argument('--z-amp', type=float, default=None, help='Vertical amplitude (m) for 3D helix')
     parser.add_argument('--loops', type=float, default=None, help='Number of periods for periodic curves')
@@ -856,6 +864,8 @@ def main():
             flight.config['speed'] = float(args.speed)
         if args.offset is not None:
             flight.config['offset'] = np.array(args.offset, dtype=float)
+        if args.direction is not None:
+            flight.config['direction'] = np.asarray(args.direction, dtype=float)
         if args.radius is not None:
             flight.config['radius'] = float(args.radius)
         if args.z_amp is not None:

@@ -46,7 +46,9 @@ public:
       solve_trace_.open(trace_path, std::ios::out | std::ios::trunc);
       if (solve_trace_.is_open())
       {
-        solve_trace_ << "steady_s,solve_us,step_us,iterations,status,solver_status\n";
+        solve_trace_ << "steady_s,solve_us,step_us,iterations,status,solver_status,"
+                     << "finished_ros_ns,odometry_receipt_ros_ns,odometry_timestamp_us,"
+                     << "odometry_sample_us,state_wait_us,reference_start_ns\n";
         solve_trace_ << std::fixed << std::setprecision(6);
         solve_trace_.flush();
       }
@@ -130,7 +132,7 @@ private:
       odometry_at_.reset();
       return;
     }
-    // PX4 boot timestamps are not ROS time. Use them only to reject replay/frozen samples.
+    // DDS may translate PX4 stamps to host time. Use sample stamps for ordering here.
     if (message.timestamp_sample <= last_sample_) return;
     last_sample_ = message.timestamp_sample;
     if (reset_counter_ && *reset_counter_ != message.reset_counter)
@@ -146,7 +148,8 @@ private:
       return;
     }
     odometry_at_ = Clock::now();
-    // Pair the measured state with ROS receipt time, never PX4 boot time.
+    odometry_timestamp_us_ = message.timestamp;
+    // Preserve receipt-time anchoring; diagnostics separately record the sample stamp.
     odometry_ros_ns_ = get_clock()->now().nanoseconds();
   }
 
@@ -223,7 +226,10 @@ private:
     const double step_us = std::chrono::duration<double, std::micro>(finished - started).count();
     solve_trace_ << steady_s << ',' << solve_us << ',' << step_us << ','
                  << result.iterations << ',' << static_cast<int>(result.status) << ','
-                 << result.solver_status << '\n';
+                 << result.solver_status << ',' << get_clock()->now().nanoseconds() << ','
+                 << odometry_ros_ns_ << ',' << odometry_timestamp_us_ << ',' << last_sample_ << ','
+                 << std::chrono::duration<double, std::micro>(started - *odometry_at_).count() << ','
+                 << reference_start_ns_ << '\n';
     if (++solve_count_ % 5 == 0 || result.status != mpc::Status::Solved)
       solve_trace_.flush();
   }
@@ -280,7 +286,7 @@ private:
   std::vector<dynamics::State> reference_states_;
   std::vector<dynamics::ControlInput> reference_inputs_;
   std::optional<Clock::time_point> odometry_at_, status_at_, reference_at_;
-  std::uint64_t last_sample_{}, last_status_{};
+  std::uint64_t last_sample_{}, last_status_{}, odometry_timestamp_us_{};
   std::optional<std::uint8_t> reset_counter_;
   bool status_healthy_{false};
   std::unique_ptr<const uav_ommpc_controller::reference::PolynomialReference> trajectory_;

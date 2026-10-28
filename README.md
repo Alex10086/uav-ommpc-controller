@@ -390,7 +390,7 @@ This is a clean wire-interface cutover: the sampled `ReferenceState`/`ReferenceT
 - `header.frame_id` must be `"ned"` and positions use the same local NED origin as odometry. ENU plans must be transformed upstream, not merely relabeled.
 - `header.stamp` is the ROS time of the first segment. Republishing the same plan renews its receipt watchdog **without changing that stamp**. A shifted rolling window must update both its coefficients and its start stamp.
 - New plans are validated/decoded once on receipt and cached immutably. A malformed replacement clears the previous plan; unsupported degree, discontinuous derivatives, nonfinite values and invalid terminal holds are rejected.
-- Each accepted odometry packet records its **ROS reception time**. The node pairs that state with reference samples at reception time plus `k*dt`, without floor indexing. PX4 boot timestamps are used only for freshness/replay checks. This does not compensate transport delay before receipt or predict an old state forward using an assumed actuator input.
+- Each accepted odometry packet records its **ROS reception time**. The node pairs that state with reference samples at reception time plus `k*dt`, without floor indexing. Message sample timestamps are used for ordering checks, not prediction anchoring. With DDS time synchronization enabled, both PX4 timestamp fields are translated to the agent/host clock; they are not raw boot times. This controller still does not compensate transport delay before receipt or predict an old state forward using an assumed actuator input.
 - Current time, the odometry reception anchor, steady-clock freshness and geometry validity are checked. Future plans wait; expired non-holding plans stop. A complete N-step horizon is required. An explicitly stationary hold may extend beyond the final segment while the receipt lease remains fresh.
 - An odometry receipt stamp within **one control period** before the plan start is treated as plan time zero instead of being rejected. This absorbs publisher/subscriber clock skew and scheduling jitter without pretending to know the transport delay; anything older is still refused.
 - Keep the existing default `reference_timeout=0.5 s` by periodically renewing the plan. A long geometric duration or `hold_final=true` is not permission to continue after losing the planner. Planner/controller ROS clocks must be consistent.
@@ -418,7 +418,7 @@ This is an explicit hover target, not automatic takeoff or origin selection. For
 - Odometry pose frame must be `POSE_FRAME_NED`. Velocity may be `VELOCITY_FRAME_NED`, or `VELOCITY_FRAME_BODY_FRD`, in which case it is rotated by the body-to-world attitude. Arbitrary-heading FRD navigation frames and unknown frames are rejected; no ENU/FLU conversion is performed.
 - Odometry position, velocity and quaternion must be finite. Quaternion norm must be within `1e-3` of one; accepted float32 PX4 quaternions are normalized. Polynomial attitude is computed from analytic acceleration/jerk/yaw instead of received reference quaternions.
 - The installed PX4 message labels `quality` as unused; its default zero is **not** used to reject otherwise valid odometry. Measured angular velocity and covariance are not consumed by this p/v/R model.
-- PX4 `timestamp_sample` must be positive, no greater than the message timestamp, and strictly advance before refreshing the odometry cache. Status timestamps must also advance. These boot-time values are never compared to ROS wall time. Duplicates/out-of-order packets do not refresh freshness. Restart the node after PX4 reboots and its timestamps return to a smaller epoch.
+- PX4 `timestamp_sample` must be positive, no greater than the message timestamp, and strictly advance before refreshing the odometry cache. Status timestamps must also advance. The control gate does not compare these message stamps with ROS wall time; diagnostics record both to measure age when DDS synchronization is enabled. Duplicates/out-of-order packets do not refresh freshness. Restart the node if the source clock restarts or moves backward.
 - Fresh valid odometry, fresh reference receipt and fresh healthy vehicle status are all required. Vehicle status must report rotary-wing operation, not a VTOL transition, no failsafe and no termination mode. A fresh invalid odometry packet invalidates the cached state rather than continuing on its old value.
 - A changed odometry `reset_counter` invalidates the cached reference. The planner must publish a new trajectory in the updated local frame; the node cannot determine whether the planner actually corrected its origin. A backward ROS clock jump also invalidates the reference.
 - Malformed polynomial metadata/coefficients invalidate the old plan. Invalid geometry, unavailable full horizons, excessive dynamics defects, out-of-bound feedforward or solver failure produce **no control message**. No zero-thrust or last-solution fallback is generated.
@@ -679,7 +679,7 @@ The runner writes `result.json`, aggregate `trace.csv`, phase JSON/CSV, analytic
 
 `--record-bag` records 13 reference/telemetry/control/command/acknowledgement topics into `bag/` and closes the recorder via SIGINT with bounded cleanup. Check `rosbag.log` and `ros2 bag info RUN_DIR/bag`. Bags include command topics: **never replay them into a live aircraft or an active control domain**. Analyze offline or use an isolated domain and explicit non-command topic selection.
 
-The current node does not publish per-solve iteration/latency diagnostics. Stable solving is evidenced here by actual continuous OMMPC output, gap metrics and retained node logs; these are not fabricated per-QP timing or failure counters.
+The node writes per-solve iteration/status and timing to `solve_trace_path` (default `/tmp/ommpc_solve_trace.csv`). The flight runner copies the flight interval to `solve_timing.csv`. Fields also include solve-finish ROS nanoseconds, odometry receipt nanoseconds, DDS publication/sample microseconds, steady-clock wait from receipt to solve start, and reference start. This is a diagnostic trace, not a new ROS topic or delay-compensation mechanism.
 
 ### Observed PX4/Gazebo results — polynomial version
 
@@ -1127,6 +1127,175 @@ $PY tools/extract_rate_bridge_reference.py "$ROOT/rate-comp-id-final"
 $PY tools/analyze_rate_compensation.py "$ROOT/rate-comp-id-final" --at-bridge
 python3 tools/analyze_rate_compensation_tracking.py "$ROOT/rate-comp-track-final"
 ```
+
+#### Native-clock tracking diagnosis and peak-error windows
+
+`tools/analyze_tracking_diagnosis.py` evaluates bagged polynomial references
+against ULog **simulation ground truth**, rather than treating estimator receipt
+time as the physical state time. It adds:
+
+- First maximum position error, native PX4 time, phase-relative time,
+  flight-relative time and mapped ROS nanoseconds.
+- Signed tangent error `dot(reference-position, reference_velocity/|velocity|)`;
+  positive means behind the reference. Cross-track is the norm of the
+  perpendicular **3-D vector**, not a signed planar error. Its components are
+  also exported. At reference speed <=0.05 m/s both decompositions are undefined
+  (`null`/blank), while total position error remains valid.
+- Full-phase and maximum ±1 s PNG/PDF curves: desired/actual position and
+  velocity, total/tangent/cross/axis errors, PX4 setpoint versus gyro, attitude
+  error, controller state age where covered, and lateral dynamics residual.
+  Boundary-clipped windows report their actual before/after coverage.
+- A control-use decomposition: estimator error at sample time, physical motion
+  during sample age, and held-state error at solve finish. These are vectors
+  whose sum is exact; their RMS magnitudes are **not additive error percentages**.
+
+Clock/frame rules:
+
+1. For protocol-2 `timesync_status`, `native = ROS + estimated_offset`.
+   The analyzer interpolates the measured clock relation and refuses
+   extrapolation/nonmonotonic clocks. RTT and offset variation remain in the
+   report. Ground-truth timestamps are Gazebo bridge callback times, so this
+   does not establish sub-millisecond physical sensor timing.
+2. Outgoing DDS translates **both** `timestamp` and `timestamp_sample`.
+   Controller receipt/solve timestamps are recorded inside the C++ node;
+   recorder callback time is not substituted for controller receipt.
+3. Ground truth uses Gazebo world origin; the EKF uses local NED origin. A
+   translation is fixed from stationary pre-arm data, never fitted over the
+   moving trajectory. Position/origin resets require an explicit transform and
+   are rejected. Heading/velocity resets are reported separately; the aggregate
+   odometry reset counter is not automatically a position-frame change.
+4. Published EKF control states are output-predicted to the IMU sample time;
+   do not subtract an additional fusion-horizon delay. No best-fit lag shift
+   changes primary tracking errors. Inner-loop best-fit shifts are labeled
+   correlation diagnostics, not isolated dead time.
+
+Tracking is sampled on a uniform 20 ms native grid; reported maxima are sampled
+maxima, not continuous-time certificates. The dynamics diagnostic differentiates
+truth velocity with a centered 7-point cubic Savitzky–Golay filter and rotates
+`a_truth - [0,0,9.8]` into body coordinates. Its x/y components remove unknown
+axial thrust. They still contain differentiation/interpolation error and
+unmodeled lateral forces; they are **not automatically all aerodynamic drag**.
+This uses actual world gravity 9.8 m/s², not the controller's 9.80665.
+The actual SUPER motor SDF specifies rotor drag `8.06428e-5` per rotor and
+motor response 12.5 ms up / 25 ms down. ESC RPM telemetry echoes commands,
+not measured post-filter rotor speed.
+
+The diagnostic suite keeps Q/R/N, vehicle, quadratic thrust mapping and rate
+compensation OFF fixed. With `--repeats 2` it runs eight flights: 1.0 and
+3.9 m/s straight lines once in each direction, plus two Sharp3D 3.85 m/s and
+two S-curve 3.9 m/s runs. Straight-line pairs are mirrored-direction trials,
+not identical-direction repetitions. Existing result directories are refused.
+
+```bash
+source ~/ros2-px4-env.bash
+source ~/uav_control_ws/install/setup.bash
+ROOT=~/uav_control_ws/ommpc-flight-results/NEW_TIMING_DIAGNOSIS
+python3 tools/run_rate_compensation_ab.py --confirm-sitl --suite diagnostics \
+  --repeats 2 --output-root "$ROOT"
+export PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH
+~/.venvs/px4-v1.17/bin/python tools/analyze_tracking_diagnosis.py "$ROOT"
+python3 tools/analyze_rate_compensation_tracking.py "$ROOT"
+```
+
+Each flight gains `diagnostics/report.json`, `<phase>_errors.csv`,
+`<phase>_peak.png`, `<phase>_peak.pdf`, controller timing/decomposition CSV,
+and `<phase>_dynamics.csv`. The campaign gains `diagnosis_comparison.json`.
+The existing OFF/ON aggregator includes the corrected `native_truth_*` metrics
+when available and explicitly labels its original receipt-time metrics;
+it does not pool the two definitions.
+
+##### Observed timing diagnosis and GPS-delay intervention
+
+Evidence: `timing-diagnosis-20261028` (8 baseline flights) and
+`timing-diagnosis-gps0-20261028` (4 intervention flights), under the workspace
+flight-results directory. All 12 landed/disarmed, all ULogs had zero dropouts,
+and controller-used sample IDs matched bagged states in 100% of recorded solves.
+The Release ROS build and 25 ROS-package tests passed; 13 diagnostic numerical
+tests cover clock sign/drift/bounds, heading versus position resets, projection,
+stationary errors and peak-window edges. Actual PNG/PDF output was inspected.
+
+The strongest tested issue is **the SITL GPS measurement-delay configuration**,
+not just late delivery of the state. Baseline ULogs contain
+`EKF2_GPS_DELAY=110 ms`. In this checkout:
+
+- `PX4-Autopilot/src/modules/simulation/gz_bridge/GZBridge.cpp:713-799` stamps
+  GPS sample/publication at the NavSat callback and adds noise, without a
+  corresponding 110 ms measurement queue.
+- `PX4-Autopilot/src/modules/ekf2/EKF/estimator_interface.cpp:180-182` subtracts
+  the configured GPS delay before buffering the measurement.
+
+On 3.9 m/s straight-line cruise, the same-sample estimator position was ahead
+of truth by an equivalent median **101–112 ms** (position discrepancy projected
+on velocity, not transport latency). Temporarily setting only the requested
+GPS-delay override to 0 ms reduced that discrepancy to about **-7 to -8 ms**.
+The control law, Q/R/N, rate gains, motor/drag model and compensation-OFF setting
+were unchanged. All controller hashes match
+`a7d3708d5b7d10a99b5cbe9e39fad7a9fed13e5ad9ed992ea221c2c5e8f5098b`.
+
+True position RMSE is the mean of two full-phase run RMSEs. Maximum error is the
+worst sample of the two runs. Straight-line trials use opposite directions.
+
+| Case | Position RMSE, GPS delay 110→0 ms (m) | Observed RMSE reduction | Worst position error 110→0 ms (m) | Same-sample estimator position RMSE 110→0 ms (m) |
+| --- | --- | ---: | --- | --- |
+| Straight line, 3.9 m/s | 0.3242→0.0519 | 84.0% | 0.5881→0.1180 | 0.2876→0.0462 |
+| Sharp3D, 3.85 m/s | 0.1862→0.0798 | 57.2% | 0.4957→0.2231 | 0.1413→0.0522 |
+
+These percentages are **observed tracking improvements, not causal shares of
+the original error**. Campaigns were sequential and each case has only two
+runs. Flight counters differ; one Sharp3D baseline also had a different
+automatically calibrated `CAL_BARO0_OFF` (-2.4414 versus 0), so its vertical
+improvement is not attributed solely to GPS delay. The other three pairs have
+no initial parameter differences apart from GPS delay and flight counters.
+Exact differences are preserved in the intervention's `baseline_comparison.json`.
+No 0 ms S-curve test was performed; do not extrapolate the measured percentage.
+
+Peak examples from the 110 ms baseline (time since the named phase starts):
+
+| Run | Peak time (s) | Total error (m) | Signed tangent (m) | Cross-track (m) |
+| --- | ---: | ---: | ---: | ---: |
+| line-3.9-r2 | 6.28 | 0.5881 | +0.5844 | 0.0659 |
+| scurve-3.9-r1 | 6.60 | 0.5362 | +0.0729 | 0.5313 |
+| sharp3d-3.85-r2 | 6.12 | 0.4957 | +0.2120 | 0.4481 |
+
+The straight-line peak occurs during cruise, with small angular-rate error;
+the turn peaks have much larger cross-track error. Some peaks occur at rest:
+for `line-1.0-r1`, 0.1105 m at 16.42 s has no defined tangent/cross-track split.
+
+Remaining limitations after fixing the experiment's GPS-delay assumption:
+
+- Controller sample age at solve finish remains about 13–35 ms by per-run
+  median in the intervention (baseline medians 7–33 ms). It did not uniformly
+  improve. Receipt anchoring and state propagation are still worth testing,
+  separately from estimator measurement timing.
+- Roll/Pitch native setpoint-to-gyro effective lag remains roughly 26–50 ms
+  across these runs. Yaw is slower; some correlation optima touch the ±150 ms
+  search boundary and must not be read as identified dead time. These
+  timestamps retain DDS translation/clamping and sampling limitations.
+- Mirrored straight-line trials yield effective lateral drag about
+  0.079 s^-1, with opposing acceleration around 0.08 m/s² at 1 m/s and
+  0.31 m/s² at 3.9 m/s. This is consistent with the rotor-drag model.
+  Sharp-turn residual fits are poor; do not label their entire residual drag.
+- The intervention improved tracking while leaving inner-loop/drag models
+  unchanged and sometimes increasing state age. Correct the **SITL-specific
+  measurement timing** before judging new control-model changes. Then compare
+  state propagation and actual rate dynamics explicitly; add drag feedforward
+  with independently validated units. Do not copy GPS delay 0 to real hardware
+  without measuring that sensor's actual latency.
+
+Reproduce the isolated four-flight hypothesis test:
+
+```bash
+python3 tools/run_rate_compensation_ab.py --confirm-sitl --suite diagnostics \
+  --repeats 2 --cases line-3.9 sharp3d-3.85 --gps-delay-ms 0 \
+  --output-root ~/uav_control_ws/ommpc-flight-results/NEW_GPS_DELAY_TEST
+```
+
+The runner uses PX4's startup environment override, saves the parameter store
+beside the evidence, and restores it only after confirmed landing/disarm and
+PX4 shutdown. It refuses to restore over a live PX4 process. Final parameter
+files were verified byte-identical to their backups; the original 110 ms
+baseline is restored, rate compensation remains OFF, and no new control model
+or permanent GPS-delay setting was adopted by this diagnosis.
 
 ### Historical PX4/Gazebo results — sampled-reference version
 
