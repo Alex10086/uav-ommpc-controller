@@ -27,7 +27,7 @@ restart_px4() {
     source "$HOME/.venvs/px4-v1.17/bin/activate"
     export CMAKE_BUILD_PARALLEL_LEVEL=4 MAKEFLAGS=-j4
     cd "$HOME/PX4-Autopilot" || exit 1
-    HEADLESS=1 nohup make px4_sitl gz_super > /tmp/px4-sweep.log 2>&1 &
+    nohup bash "$SRC/tools/start_super_sitl.sh" > /tmp/px4-sweep.log 2>&1 &
   )
   for _ in $(seq 1 90); do
     grep -q 'Ready for takeoff' /tmp/px4-sweep.log 2>/dev/null && break

@@ -11,6 +11,7 @@ COMPLEX_SPEEDS="${COMPLEX_SPEEDS-1.6 2.0}"
 RADIUS="${RADIUS:-1.2}"
 Z_AMP="${Z_AMP:-0.35}"
 HIGHSPEEDS="${HIGHSPEEDS-2.5 3.0 3.5 4.0}"
+SUPER_LAUNCHER="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/start_super_sitl.sh"
 
 restart_px4() {
   pkill -9 -x px4 2>/dev/null
@@ -20,7 +21,11 @@ restart_px4() {
     source "$HOME/.venvs/px4-v1.17/bin/activate"
     export CMAKE_BUILD_PARALLEL_LEVEL=4 MAKEFLAGS=-j4
     cd "$HOME/PX4-Autopilot" || exit 1
-    HEADLESS=1 nohup make px4_sitl "$PX4_TARGET" > /tmp/px4-sweep.log 2>&1 &
+    if [ "$PX4_TARGET" = gz_super ]; then
+      nohup bash "$SUPER_LAUNCHER" > /tmp/px4-sweep.log 2>&1 &
+    else
+      HEADLESS=1 nohup make px4_sitl "$PX4_TARGET" > /tmp/px4-sweep.log 2>&1 &
+    fi
   )
   for _ in $(seq 1 90); do
     grep -q 'Ready for takeoff' /tmp/px4-sweep.log 2>/dev/null && break

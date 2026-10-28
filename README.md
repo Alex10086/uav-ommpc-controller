@@ -764,8 +764,8 @@ To run `gz_super` in SITL alongside the existing `x500` workflow:
 ```bash
 # Terminal 2: PX4 and headless Gazebo with SUPER model.
 source ~/px4-env.bash
-cd ~/PX4-Autopilot
-HEADLESS=1 make -j4 px4_sitl gz_super
+cd ~/uav_control_ws/src/uav-ommpc-controller
+bash tools/start_super_sitl.sh
 
 # Terminal 3: bridge calibrated for 1.64 kg SUPER.
 source ~/ros2-px4-env.bash
@@ -1292,10 +1292,98 @@ python3 tools/run_rate_compensation_ab.py --confirm-sitl --suite diagnostics \
 
 The runner uses PX4's startup environment override, saves the parameter store
 beside the evidence, and restores it only after confirmed landing/disarm and
-PX4 shutdown. It refuses to restore over a live PX4 process. Final parameter
-files were verified byte-identical to their backups; the original 110 ms
-baseline is restored, rate compensation remains OFF, and no new control model
-or permanent GPS-delay setting was adopted by this diagnosis.
+PX4 shutdown. It refuses to restore over a live PX4 process. At the end of that
+diagnostic campaign, parameter files were verified byte-identical to their
+backups and the original 110 ms baseline was restored. The permanent
+SUPER-specific startup correction below supersedes that historical default.
+
+##### Corrected SUPER SITL timing default
+
+`tools/start_super_sitl.sh` is the shared SUPER simulator startup entry point.
+It always sets `PX4_PARAM_EKF2_GPS_DELAY=0` before starting `gz_super`, including
+when an older parameter store or inherited `PX4_PARAM_EKF2_GPS_DELAY` says 110.
+This is a **Gazebo SUPER configuration**, not a change to PX4 firmware defaults,
+real-aircraft GPS configuration, OMMPC dynamics or reference time anchoring.
+
+Both Python campaign runners and all three shell sweep scripts use this entry
+point for SUPER. Non-SUPER targets retain their existing startup path. Normal
+campaigns use 0 ms without `--gps-delay-ms`; they no longer temporarily apply 0
+and then restore 110. The explicit diagnostic override still saves/restores
+the prior parameter store, allowing historical 110 ms comparisons.
+
+```bash
+# Normal SUPER SITL startup; activate the PX4 Python environment automatically.
+bash tools/start_super_sitl.sh
+
+# Revalidate the fixed default: 8 flights, no temporary GPS-delay override.
+python3 tools/run_rate_compensation_ab.py --confirm-sitl --suite diagnostics \
+  --repeats 2 --output-root ~/uav_control_ws/ommpc-flight-results/NEW_CORRECTED_TIMING
+
+# Only for a deliberate historical comparison, with store restoration afterward:
+python3 tools/run_rate_compensation_ab.py --confirm-sitl --suite diagnostics \
+  --repeats 1 --cases line-3.9 --gps-delay-ms 110 \
+  --output-root ~/uav_control_ws/ommpc-flight-results/NEW_HISTORICAL_GPS110
+```
+
+Use the shared launcher instead of a bare `make ... gz_super` command: bypassing
+it does not apply the repository's timing configuration. Record the effective
+`EKF2_GPS_DELAY` from the ULog, and do not mix 0/110 ms runs in one statistic.
+The corrected validation keeps quadratic thrust mapping enabled and Roll/Pitch
+compensation disabled; controller Q/R/N and the vehicle/inner-loop/drag models
+are unchanged.
+
+Permanent-default validation evidence is
+`~/uav_control_ws/ommpc-flight-results/timing-corrected-20261028`.
+Eight fresh flights ran **without** `--gps-delay-ms`, while deliberately
+inheriting `PX4_PARAM_EKF2_GPS_DELAY=110` in the parent environment. Every ULog
+recorded an effective delay of **0 ms**. After the campaign, both
+`parameters.bson` and `parameters_backup.bson` contained `EKF2_GPS_DELAY=0`;
+the corrected setting was not rolled back. All eight flights passed the
+existing flight criteria and landed/disarmed; ULogs had zero dropouts and
+controller-used sample timestamps matched the recorded states in 100% of solves.
+The shell launchers passed syntax checks; the diagnostic CLI generated the
+actual CSV/JSON/PNG/PDF outputs, and the S-curve/Sharp3D figures were inspected.
+
+The comparison below uses the original 110 ms `timing-diagnosis-20261028`
+baseline and the same native-clock ground-truth analysis, with no fitted time
+shift. RMSE is the mean of two full-phase run RMSEs, not moving-only RMSE;
+maximum error is the worse of the two runs. Straight-line trials are opposite
+directions, while S-curve and Sharp3D repeat the same reference geometry.
+
+| Case | Position RMSE 110→0 ms (m) | Observed RMSE reduction | Worst position error 110→0 ms (m) |
+| --- | --- | ---: | --- |
+| Straight line, 1.0 m/s | 0.0898→0.0510 | 43.2% | 0.1869→0.0892 |
+| Straight line, 3.9 m/s | 0.3242→0.0515 | 84.1% | 0.5881→0.1321 |
+| S-curve, 3.9 m/s | 0.2590→0.0862 | 66.7% | 0.5362→0.2045 |
+| Sharp3D, 3.85 m/s | 0.1862→0.0699 | 62.5% | 0.4957→0.2598 |
+
+Moving-only position RMSE became 0.0558, 0.0571, 0.1093 and 0.0922 m,
+respectively. Full-phase velocity RMSE became 0.0288, 0.0471, 0.0960 and
+0.1539 m/s. There were zero recorded input-bound violations. Maximum recorded
+tilt was approximately 0.696 rad; per-run mean solve times were 1.075–1.557 ms,
+with a worst observed solve of 6.203 ms versus the unchanged 20 ms period.
+
+The 3.9 m/s cruise equivalent estimator position lead was now about -4.9 and
+-12.2 ms, rather than the baseline's +101–112 ms. This geometric diagnostic
+is not transport delay. Remaining sample age at solve finish still had
+per-run medians of 11.9–34.3 ms; correcting GPS measurement timing does not
+remove transport/scheduling age or inner-loop dynamics.
+
+All eight controller hashes remain
+`a7d3708d5b7d10a99b5cbe9e39fad7a9fed13e5ad9ed992ea221c2c5e8f5098b`,
+and trajectory arguments match the baseline. Initial PX4 parameter differences
+were GPS delay, flight counters and, in four pairs, automatic barometer
+calibration. Thus these are repeatable observed improvements in this SITL
+setup, not universal performance claims or causal error-share estimates.
+No state propagation, rate-dynamics model, drag feedforward or Q/R retuning
+was introduced. Further changes should be compared against this corrected
+0 ms baseline, not the old timing-mismatched baseline.
+
+`configuration_verification.json` preserves the effective/persisted values
+and exact parameter differences. `baseline_comparison.json` preserves both
+full/moving metrics and peak/timing evidence; each flight retains its complete
+ULog, rosbag, CSV and peak-window plots. The corrected default remains
+SUPER-SITL-only; real GPS latency still requires measurement.
 
 ### Historical PX4/Gazebo results — sampled-reference version
 

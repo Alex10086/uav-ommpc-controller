@@ -61,8 +61,7 @@ def main():
             nodes(True, args.rate_compensation, args.rate_filter, args.rate_gain)
             before = set(LOG_ROOT.rglob('*.ulg'))
             with (args.output_root/f'px4-r{i}.log').open('w') as log:
-                sim = subprocess.Popen(['bash', '-lc',
-                    'source ~/.venvs/px4-v1.17/bin/activate && HEADLESS=1 make -j4 px4_sitl gz_super'],
+                sim = subprocess.Popen(['bash', str(SRC/'tools/start_super_sitl.sh')],
                     cwd=PX4, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 deadline = time.monotonic()+100
                 while time.monotonic() < deadline:
@@ -93,6 +92,7 @@ def main():
                 shutil.copy2(CONFIG, case/'controller.yaml')
                 manifest = {'ulog_source': str(source), 'controller_sha256': hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
                     'quadratic_thrust_model': True, 'hover_thrust': 0.309128,
+                    'gps_delay_ms': 0.0,
                     'rate_compensation_enabled': args.rate_compensation,
                     'rate_compensation_filter_time_constant': args.rate_filter,
                     'rate_compensation_gain': [args.rate_gain, args.rate_gain],

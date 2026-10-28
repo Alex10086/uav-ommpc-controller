@@ -41,7 +41,6 @@ def track(out, case, enabled, arguments=None, gps_delay_ms=None):
     before=set(LOG_ROOT.rglob('*.ulg'))
     px4_log = out.parent / (out.name + '.px4.log')
     flight_log_path = out.parent / (out.name + '.flight.log')
-    environment = os.environ.copy()
     saved_parameters = {}
     if gps_delay_ms is not None:
         if subprocess.run(['pgrep', '-x', 'px4'], capture_output=True).returncode == 0:
@@ -53,11 +52,10 @@ def track(out, case, enabled, arguments=None, gps_delay_ms=None):
             saved_parameters[path] = path.exists()
             if path.exists():
                 shutil.copy2(path, backup / name)
-        environment['PX4_PARAM_EKF2_GPS_DELAY'] = str(gps_delay_ms)
     with px4_log.open('x') as log:
-        sim=subprocess.Popen(['bash','-lc',
-            'source ~/.venvs/px4-v1.17/bin/activate && HEADLESS=1 make -j4 px4_sitl gz_super'],
-            cwd=PX4,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,env=environment)
+        sim=subprocess.Popen(['bash',str(SRC/'tools/start_super_sitl.sh'),
+            str(int(gps_delay_ms)) if gps_delay_ms is not None else '0'],
+            cwd=PX4,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         deadline=time.monotonic()+100
         while time.monotonic()<deadline:
             if 'Ready for takeoff' in px4_log.read_text(errors='replace'):
@@ -86,6 +84,7 @@ def track(out, case, enabled, arguments=None, gps_delay_ms=None):
             'case':case,'rate_compensation_enabled':enabled,
             'trajectory_arguments':CASES[case] if arguments is None else arguments,
             'gps_delay_override_ms':gps_delay_ms,
+            'gps_delay_ms':0.0 if gps_delay_ms is None else gps_delay_ms,
             'gain':[1.08,1.08],'plant_time_constant_s':[.0275,.0275],
             'filter_time_constant_s':.020,'quadratic_thrust_model':True,
             'controller_sha256':hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
@@ -125,7 +124,7 @@ def main():
     cli.add_argument('--cases', choices=tuple(DIAGNOSTIC_CASES), nargs='+',
                      help='Diagnostic cases only; default runs all four')
     cli.add_argument('--gps-delay-ms', type=float, choices=[0.0,110.0],
-                     help='Diagnostic-only startup override; restores saved SITL parameters after landing/shutdown')
+                     help='Diagnostic-only override of normal 0 ms; restores prior SITL parameters after shutdown')
     args=cli.parse_args()
     if args.repeats<1 or args.first_repeat<1:
         cli.error('repeat counts must be positive')
